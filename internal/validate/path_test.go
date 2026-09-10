@@ -6,6 +6,7 @@ package validate
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -26,14 +27,18 @@ func TestSafeOutputPath_RejectsPathTraversalAndDangerousInput(t *testing.T) {
 		{"unicode normal", "报告.xlsx", false},
 		{"dot-dot resolves to cwd", "subdir/..", false},
 
+		// ── GIVEN: empty or blank paths → THEN: rejected ──
+		{"empty path", "", true},
+		{"blank path", "   ", true},
+
 		// ── GIVEN: path traversal via .. → THEN: rejected ──
-		{"dot-dot escape", "../../.ssh/authorized_keys", true},
+		{"dot-dot escape", "../../../../../../../../../../../../.ssh/authorized_keys", true},
 		{"dot-dot mid path", "subdir/../../etc/passwd", true},
-		{"triple dot-dot", "../../../etc/shadow", true},
+		{"triple dot-dot", "../../../../../../../../../../../../etc/shadow", true},
 
 		// ── GIVEN: absolute paths → THEN: rejected ──
 		{"absolute path unix", "/etc/passwd", true},
-		{"absolute path root", "/tmp/evil", true},
+		{"absolute path denylisted", "/etc/evil", true},
 
 		// ── GIVEN: control characters in path → THEN: rejected ──
 		{"null byte", "file\x00.txt", true},
@@ -49,7 +54,7 @@ func TestSafeOutputPath_RejectsPathTraversalAndDangerousInput(t *testing.T) {
 
 		// ── GIVEN: looks dangerous but is actually safe → THEN: allowed ──
 		{"literal percent 2e", "%2e%2e/etc/passwd", false},
-		{"tilde path", "~/file.txt", false},
+		{"tilde path outside allowlist", "~/file.txt", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// WHEN: SafeOutputPath validates the path
@@ -186,7 +191,7 @@ func TestSafeLocalFlagPath(t *testing.T) {
 		{"http URL passes through", "--image", "http://example.com/a.jpg", "http://example.com/a.jpg", ""},
 		{"https URL passes through", "--image", "https://example.com/a.jpg", "https://example.com/a.jpg", ""},
 		{"relative path accepted, returned unchanged", "--file", "photo.jpg", "photo.jpg", ""},
-		{"path traversal rejected", "--file", "../escape.txt", "", "--file"},
+		{"path traversal rejected", "--file", "../../../../../../../../../../../../escape.txt", "", "--file"},
 		{"absolute path rejected", "--image", "/etc/passwd", "", "--image"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,9 +212,29 @@ func TestSafeLocalFlagPath(t *testing.T) {
 	}
 }
 
+func TestLocalInputPath_AllowsLocalPathsAndRejectsUnsafeCharacters(t *testing.T) {
+	for _, path := range []string{"/tmp/report.pdf", "../report.pdf"} {
+		got, err := LocalInputPath(path)
+		if err != nil || got != path {
+			t.Fatalf("LocalInputPath(%q) = %q, %v; want unchanged path", path, got, err)
+		}
+	}
+	if _, err := LocalInputPath("report\n.pdf"); err == nil {
+		t.Fatal("LocalInputPath() unexpectedly accepted a control character")
+	}
+}
+
 func TestSafeUploadPath_AllowsTempFileAbsolutePath(t *testing.T) {
-	// GIVEN: a real temp file (absolute path under os.TempDir())
-	f, err := os.CreateTemp("", "upload-test-*.bin")
+	// GIVEN: a real file under the built-in temp allow root. The root is used
+	// explicitly rather than os.CreateTemp("", ...), whose location follows
+	// TMPDIR and would otherwise decide the verdict per host.
+	// The Windows temp root is derived from the account record, which this
+	// package cannot reach; localfileio's own test covers that platform.
+	if runtime.GOOS == "windows" {
+		t.Skip("temp allow root is verified in the localfileio package on Windows")
+	}
+	tmpRoot := "/tmp"
+	f, err := os.CreateTemp(tmpRoot, "upload-test-*.bin")
 	if err != nil {
 		t.Fatalf("CreateTemp: %v", err)
 	}
@@ -217,12 +242,19 @@ func TestSafeUploadPath_AllowsTempFileAbsolutePath(t *testing.T) {
 	f.Close()
 	t.Cleanup(func() { os.Remove(tmpPath) })
 
-	// WHEN: SafeUploadPath validates the absolute temp path
-	_, err = SafeInputPath(tmpPath)
+	// WHEN: SafeInputPath validates the absolute temp path
+	got, err := SafeInputPath(tmpPath)
 
-	// THEN: absolute paths are rejected even in temp dir
-	if err == nil {
-		t.Fatal("expected error for absolute temp path, got nil")
+	// THEN: accepted — the temp directory is a built-in allow root
+	if err != nil {
+		t.Fatalf("SafeInputPath(%q) error = %v, want nil", tmpPath, err)
+	}
+	want, err := filepath.EvalSymlinks(tmpPath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if got != want {
+		t.Errorf("SafeInputPath(%q) = %q, want %q", tmpPath, got, want)
 	}
 }
 
@@ -281,5 +313,32 @@ func TestSafeInputPath_ErrorMessageContainsCorrectFlagName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--output") {
 		t.Errorf("error should mention --output, got: %s", err.Error())
+	}
+}
+
+// TestSafeEnvDirPath_RequiresAbsolutePath verifies that environment-provided
+// directory paths must be absolute.
+func TestSafeEnvDirPath_RequiresAbsolutePath(t *testing.T) {
+	_, err := SafeEnvDirPath("logs", "LARKSUITE_CLI_LOG_DIR")
+	if err == nil {
+		t.Fatal("expected error for relative path")
+	}
+	if !strings.Contains(err.Error(), "LARKSUITE_CLI_LOG_DIR") {
+		t.Fatalf("error should mention env name, got %v", err)
+	}
+}
+
+// TestSafeEnvDirPath_ReturnsNormalizedAbsolutePath verifies that a valid
+// absolute environment directory is cleaned and resolved to its canonical path.
+func TestSafeEnvDirPath_ReturnsNormalizedAbsolutePath(t *testing.T) {
+	base := t.TempDir()
+	base, _ = filepath.EvalSymlinks(base)
+	got, err := SafeEnvDirPath(filepath.Join(base, "logs", "..", "auth"), "LARKSUITE_CLI_LOG_DIR")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := filepath.Join(base, "auth")
+	if got != want {
+		t.Fatalf("SafeEnvDirPath() = %q, want %q", got, want)
 	}
 }

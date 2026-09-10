@@ -5,16 +5,72 @@
 // macOS uses the system Keychain; Linux uses AES-256-GCM encrypted files; Windows uses DPAPI + registry.
 package keychain
 
+import (
+	"errors"
+	"fmt"
+
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/internal/recovery"
+)
+
+var (
+	// ErrNotFound is returned when the requested credential is not found.
+	ErrNotFound = errors.New("keychain: item not found")
+
+	// errNotInitialized is an internal error indicating the master key is missing or invalid.
+	errNotInitialized = errors.New("keychain not initialized")
+)
+
 const (
-	// LarkCliService is the unified keychain service name for all secrets
-	// (both AppSecret and UAT). Entries are distinguished by account key format:
+	// LarkCliService is the unified keychain service name for all secrets.
+	// Entries are distinguished by account key format:
 	//   - AppSecret: "appsecret:<appId>"
+	//   - Stored TAT: "tat:v1:<sha256(appId)>"
 	//   - UAT:       "<appId>:<userOpenId>"
 	LarkCliService = "lark-cli"
 )
 
+// wrapError classifies keychain failures at the storage boundary and carries a
+// hint for troubleshooting keychain access issues.
+// nil and ErrNotFound pass through unchanged.
+func wrapError(op string, err error) error {
+	if err == nil || errors.Is(err, ErrNotFound) {
+		return err
+	}
+
+	msg := fmt.Sprintf("keychain %s failed: %v", op, err)
+	func() {
+		defer func() { recover() }()
+		LogAuthError("keychain", op, fmt.Errorf("keychain %s error: %w", op, err))
+	}()
+
+	return recovery.Attach(
+		errs.NewInternalError(errs.SubtypeStorage, "%s", msg).WithCause(err),
+		RecoveryHint(err),
+	)
+}
+
+// RecoveryHint separates generic guidance from command-specific recovery.
+func RecoveryHint(err error) recovery.Hint {
+	base := "Check if the OS keychain/credential manager is locked or accessible. If running inside a sandbox or CI environment, please ensure the process has the necessary permissions to access the keychain, you can try running this outside the sandbox."
+	parts := []recovery.Part{}
+	if errors.Is(err, errNotInitialized) {
+		base = "The keychain master key may have been cleaned up or deleted. If running inside a sandbox or CI environment, please ensure the process has the necessary permissions to access the keychain, you can try running this outside the sandbox."
+		parts = append(parts, recovery.Text(base), recovery.Command(
+			recovery.TargetConfigInit,
+			" Otherwise, please reconfigure the CLI by running lark-cli config init.",
+		))
+	} else {
+		parts = append(parts, recovery.Text(base))
+	}
+	if extra := extraHint(err); extra != "" {
+		parts = append(parts, recovery.Command(recovery.TargetConfigKeychainDowngrade, extra))
+	}
+	return recovery.Join("", parts...)
+}
+
 // KeychainAccess abstracts keychain Get/Set/Remove for dependency injection.
-// Used by AppSecret operations (ForStorage, ResolveSecretInput, RemoveSecretStore).
+// Used by AppSecret and stored-TAT operations.
 // UAT operations in token_store.go use the package-level Get/Set/Remove directly.
 type KeychainAccess interface {
 	Get(service, account string) (string, error)
@@ -24,16 +80,17 @@ type KeychainAccess interface {
 
 // Get retrieves a value from the keychain.
 // Returns empty string if the entry does not exist.
-func Get(service, account string) string {
-	return platformGet(service, account)
+func Get(service, account string) (string, error) {
+	val, err := platformGet(service, account)
+	return val, wrapError("Get", err)
 }
 
 // Set stores a value in the keychain, overwriting any existing entry.
 func Set(service, account, data string) error {
-	return platformSet(service, account, data)
+	return wrapError("Set", platformSet(service, account, data))
 }
 
 // Remove deletes an entry from the keychain. No error if not found.
 func Remove(service, account string) error {
-	return platformRemove(service, account)
+	return wrapError("Remove", platformRemove(service, account))
 }

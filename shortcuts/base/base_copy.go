@@ -12,9 +12,10 @@ import (
 var BaseBaseCopy = common.Shortcut{
 	Service:     "base",
 	Command:     "+base-copy",
-	Description: "Copy a base resource",
+	Description: "Copy a Base resource (not a BaseApp)",
 	Risk:        "write",
-	Scopes:      []string{"base:app:copy"},
+	UserScopes:  []string{"base:app:copy"},
+	BotScopes:   []string{"base:app:copy", "docs:permission.member:create"},
 	AuthTypes:   authTypes(),
 	Flags: []common.Flag{
 		baseTokenFlag(true),
@@ -22,6 +23,12 @@ var BaseBaseCopy = common.Shortcut{
 		{Name: "folder-token", Desc: "folder token for destination"},
 		{Name: "without-content", Type: "bool", Desc: "copy structure only"},
 		{Name: "time-zone", Desc: "time zone, e.g. Asia/Shanghai"},
+	},
+	Tips: []string{
+		"BaseApp/AppMode copy is unsupported. Do not pass an app_token or use this command as a substitute.",
+		`Example: lark-cli base +base-copy --base-token <base_token> --name "Copy of Project Tracker"`,
+		"Use --without-content when the user wants only structure.",
+		"If copied as bot, output may include permission_grant; report it so the user knows whether they can open the new Base.",
 	},
 	DryRun: dryRunBaseCopy,
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {

@@ -5,18 +5,18 @@ package task
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
+// GetMyTasks lists tasks assigned to the current user.
 var GetMyTasks = common.Shortcut{
 	Service:     "task",
 	Command:     "+get-my-tasks",
@@ -28,12 +28,13 @@ var GetMyTasks = common.Shortcut{
 
 	Flags: []common.Flag{
 		{Name: "query", Desc: "search for tasks by summary (exact match first, then partial match)"},
-		{Name: "complete", Type: "bool", Desc: "if true, query completed tasks; default is false"},
+		{Name: "complete", Type: "bool", Desc: "if true, query completed tasks;if false, query incompleted tasks; if not provided, both completed and incompleted tasks are queried."},
 		{Name: "created_at", Desc: "query tasks created after this time (date/relative/ms)"},
 		{Name: "due-start", Desc: "query tasks with due date after this time (date/relative/ms)"},
 		{Name: "due-end", Desc: "query tasks with due date before this time (date/relative/ms)"},
 		{Name: "page-all", Type: "bool", Desc: "automatically paginate through all pages (max 40)"},
 		{Name: "page-limit", Type: "int", Default: "20", Desc: "max page limit (default 20, max 40 with --page-all)"},
+		{Name: "page-token", Desc: "start from the specified page token"},
 	},
 
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
@@ -47,6 +48,9 @@ var GetMyTasks = common.Shortcut{
 		if runtime.Cmd.Flags().Changed("complete") {
 			params["completed"] = runtime.Bool("complete")
 		}
+		if pageToken := runtime.Str("page-token"); pageToken != "" {
+			params["page_token"] = pageToken
+		}
 
 		return d.GET("/open-apis/task/v2/tasks").Params(params)
 	},
@@ -54,16 +58,20 @@ var GetMyTasks = common.Shortcut{
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		startTime := time.Now()
 
-		queryParams := make(larkcore.QueryParams)
-		queryParams.Set("type", "my_tasks")
-		queryParams.Set("user_id_type", "open_id")
-		queryParams.Set("page_size", "50")
+		params := map[string]interface{}{
+			"type":         "my_tasks",
+			"user_id_type": "open_id",
+			"page_size":    50,
+		}
 		if runtime.Cmd.Flags().Changed("complete") {
 			if runtime.Bool("complete") {
-				queryParams.Set("completed", "true")
+				params["completed"] = "true"
 			} else {
-				queryParams.Set("completed", "false")
+				params["completed"] = "false"
 			}
+		}
+		if pageToken := runtime.Str("page-token"); pageToken != "" {
+			params["page_token"] = pageToken
 		}
 
 		// parse time flags to ms timestamp if provided
@@ -71,7 +79,7 @@ var GetMyTasks = common.Shortcut{
 		if createdStr := runtime.Str("created_at"); createdStr != "" {
 			tStr, err := parseTimeFlagSec(createdStr, "start")
 			if err != nil {
-				return WrapTaskError(ErrCodeTaskInvalidParams, fmt.Sprintf("invalid created_at: %v", err), "parse created_at")
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid created_at: %v", err).WithParam("--created_at")
 			}
 			createdAfterMs, _ = strconv.ParseInt(tStr, 10, 64)
 			createdAfterMs *= 1000 // Convert sec to ms
@@ -80,7 +88,7 @@ var GetMyTasks = common.Shortcut{
 		if dueStartStr := runtime.Str("due-start"); dueStartStr != "" {
 			tStr, err := parseTimeFlagSec(dueStartStr, "start")
 			if err != nil {
-				return WrapTaskError(ErrCodeTaskInvalidParams, fmt.Sprintf("invalid due-start: %v", err), "parse due-start")
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid due-start: %v", err).WithParam("--due-start")
 			}
 			dueStartMs, _ = strconv.ParseInt(tStr, 10, 64)
 			dueStartMs *= 1000
@@ -89,7 +97,7 @@ var GetMyTasks = common.Shortcut{
 		if dueEndStr := runtime.Str("due-end"); dueEndStr != "" {
 			tStr, err := parseTimeFlagSec(dueEndStr, "end")
 			if err != nil {
-				return WrapTaskError(ErrCodeTaskInvalidParams, fmt.Sprintf("invalid due-end: %v", err), "parse due-end")
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid due-end: %v", err).WithParam("--due-end")
 			}
 			dueEndMs, _ = strconv.ParseInt(tStr, 10, 64)
 			dueEndMs *= 1000
@@ -106,22 +114,7 @@ var GetMyTasks = common.Shortcut{
 
 		for {
 			pageCount++
-			apiReq := &larkcore.ApiReq{
-				HttpMethod:  "GET",
-				ApiPath:     "/open-apis/task/v2/tasks",
-				QueryParams: queryParams,
-			}
-
-			apiResp, err := runtime.DoAPI(apiReq)
-
-			var result map[string]interface{}
-			if err == nil {
-				if parseErr := json.Unmarshal(apiResp.RawBody, &result); parseErr != nil {
-					return WrapTaskError(ErrCodeTaskInternalError, fmt.Sprintf("failed to parse response: %v", parseErr), "parse my tasks")
-				}
-			}
-
-			data, err := HandleTaskApiResult(result, err, "list tasks")
+			data, err := callTaskAPITyped(runtime, http.MethodGet, "/open-apis/task/v2/tasks", params, nil)
 			if err != nil {
 				return err
 			}
@@ -142,7 +135,7 @@ var GetMyTasks = common.Shortcut{
 			}
 
 			// Set page_token for next iteration
-			queryParams.Set("page_token", lastPageToken)
+			params["page_token"] = lastPageToken
 		}
 
 		var filteredItems []map[string]interface{}
@@ -207,23 +200,29 @@ var GetMyTasks = common.Shortcut{
 		for _, item := range filteredItems {
 			urlVal, _ := item["url"].(string)
 			urlVal = truncateTaskURL(urlVal)
+			completed, completedAt := taskCompletionState(item)
 			outputItem := map[string]interface{}{
-				"guid":    item["guid"],
-				"summary": item["summary"],
-				"url":     urlVal,
+				"guid":      item["guid"],
+				"summary":   item["summary"],
+				"url":       urlVal,
+				"completed": completed,
 			}
 			if createdAtStr, ok := item["created_at"].(string); ok {
 				if ts, err := strconv.ParseInt(createdAtStr, 10, 64); err == nil {
-					outputItem["created_at"] = time.UnixMilli(ts).UTC().Format(time.RFC3339)
+					outputItem["created_at"] = time.UnixMilli(ts).Local().Format(time.RFC3339)
 				}
+			}
+			if !completedAt.IsZero() {
+				outputItem["completed_at"] = completedAt.Local().Format(time.RFC3339)
 			}
 			if dueObj, ok := item["due"].(map[string]interface{}); ok {
 				if tsStr, ok := dueObj["timestamp"].(string); ok {
 					if ts, err := strconv.ParseInt(tsStr, 10, 64); err == nil {
-						outputItem["due_at"] = time.UnixMilli(ts).UTC().Format(time.RFC3339)
+						outputItem["due_at"] = time.UnixMilli(ts).Local().Format(time.RFC3339)
 					}
 				}
 			}
+			projectTaskFields(outputItem, item, taskOutputMembers, taskOutputStart)
 			outputItems = append(outputItems, outputItem)
 		}
 
@@ -244,12 +243,13 @@ var GetMyTasks = common.Shortcut{
 				summary, _ := item["summary"].(string)
 				urlVal, _ := item["url"].(string)
 				urlVal = truncateTaskURL(urlVal)
+				completed, completedAt := taskCompletionState(item)
 
 				var dueTimeStr string
 				if dueObj, ok := item["due"].(map[string]interface{}); ok {
 					if tsStr, ok := dueObj["timestamp"].(string); ok {
 						if ts, err := strconv.ParseInt(tsStr, 10, 64); err == nil {
-							dueTimeStr = time.UnixMilli(ts).Format("2006-01-02 15:04")
+							dueTimeStr = time.UnixMilli(ts).Local().Format("2006-01-02 15:04")
 						}
 					}
 				}
@@ -257,7 +257,7 @@ var GetMyTasks = common.Shortcut{
 				var createdDateStr string
 				if createdStr, ok := item["created_at"].(string); ok {
 					if ts, err := strconv.ParseInt(createdStr, 10, 64); err == nil {
-						createdDateStr = time.UnixMilli(ts).Format("2006-01-02")
+						createdDateStr = time.UnixMilli(ts).Local().Format("2006-01-02")
 					}
 				}
 
@@ -265,6 +265,10 @@ var GetMyTasks = common.Shortcut{
 				fmt.Fprintf(w, "    ID: %s\n", guid)
 				if urlVal != "" {
 					fmt.Fprintf(w, "    URL: %s\n", urlVal)
+				}
+				fmt.Fprintf(w, "    Completed: %t\n", completed)
+				if !completedAt.IsZero() {
+					fmt.Fprintf(w, "    Completed At: %s\n", completedAt.Local().Format("2006-01-02 15:04"))
 				}
 				if dueTimeStr != "" {
 					fmt.Fprintf(w, "    Due: %s\n", dueTimeStr)
@@ -284,4 +288,16 @@ var GetMyTasks = common.Shortcut{
 
 		return nil
 	},
+}
+
+func taskCompletionState(item map[string]interface{}) (bool, time.Time) {
+	completedAtStr, _ := item["completed_at"].(string)
+	if completedAtStr == "" || completedAtStr == "0" {
+		return false, time.Time{}
+	}
+	ts, err := strconv.ParseInt(completedAtStr, 10, 64)
+	if err != nil {
+		return false, time.Time{}
+	}
+	return true, time.UnixMilli(ts)
 }

@@ -5,8 +5,11 @@ package base
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,6 +19,7 @@ import (
 
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
@@ -29,20 +33,27 @@ type fieldTypeSpec struct {
 	Extra map[string]interface{}
 }
 
-func parseJSONObject(raw string, flagName string) (map[string]interface{}, error) {
-	resolved, err := loadJSONInput(raw, flagName)
+func parseJSONObject(pc *parseCtx, raw string, flagName string) (map[string]interface{}, error) {
+	resolved, err := loadJSONInput(pc, raw, flagName)
 	if err != nil {
 		return nil, err
 	}
 	var result map[string]interface{}
 	if err := common.ParseJSON([]byte(resolved), &result); err != nil {
-		return nil, formatJSONError(flagName, "object", err)
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &syntaxErr) {
+			return nil, formatJSONError(flagName, "object", err)
+		}
+		return nil, baseFlagErrorf("--%s must be a JSON object; %s", flagName, jsonInputTip(flagName))
+	}
+	if result == nil {
+		return nil, baseFlagErrorf("--%s must be a JSON object; %s", flagName, jsonInputTip(flagName))
 	}
 	return result, nil
 }
 
-func parseJSONArray(raw string, flagName string) ([]interface{}, error) {
-	resolved, err := loadJSONInput(raw, flagName)
+func parseJSONArray(pc *parseCtx, raw string, flagName string) ([]interface{}, error) {
+	resolved, err := loadJSONInput(pc, raw, flagName)
 	if err != nil {
 		return nil, err
 	}
@@ -53,12 +64,12 @@ func parseJSONArray(raw string, flagName string) ([]interface{}, error) {
 	return result, nil
 }
 
-func parseStringListFlexible(raw string, flagName string) ([]string, error) {
+func parseStringListFlexible(pc *parseCtx, raw string, flagName string) ([]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
 	}
-	resolved, err := loadJSONInput(raw, flagName)
+	resolved, err := loadJSONInput(pc, raw, flagName)
 	if err != nil {
 		return nil, err
 	}
@@ -82,8 +93,19 @@ func parseStringListFlexible(raw string, flagName string) ([]string, error) {
 }
 
 func parseStringList(raw string) []string {
-	items, _ := parseStringListFlexible(raw, "fields")
-	return items
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func deepMergeMaps(dst, src map[string]interface{}) map[string]interface{} {
@@ -133,7 +155,7 @@ func cloneValue(value interface{}) interface{} {
 func resolveFieldTypeSpec(typeName string) (fieldTypeSpec, error) {
 	trimmed := strings.TrimSpace(typeName)
 	if trimmed == "" {
-		return fieldTypeSpec{}, fmt.Errorf("field type cannot be empty")
+		return fieldTypeSpec{}, baseValidationErrorf("field type cannot be empty")
 	}
 	switch strings.ToLower(trimmed) {
 	case "text", "phone", "url", "email", "barcode":
@@ -173,7 +195,7 @@ func resolveFieldTypeSpec(typeName string) (fieldTypeSpec, error) {
 	case "modifiedtime", "modified_time", "modified-time":
 		return fieldTypeSpec{Type: "updated_at", Extra: map[string]interface{}{"style": map[string]interface{}{"format": "yyyy/MM/dd"}}}, nil
 	default:
-		return fieldTypeSpec{}, fmt.Errorf("unsupported field type %q in base/v3", typeName)
+		return fieldTypeSpec{}, baseValidationErrorf("unsupported field type %q in base/v3", typeName)
 	}
 }
 
@@ -233,10 +255,10 @@ func normalizeSelectOptions(raw interface{}) []interface{} {
 
 func buildFieldBody(fieldName string, typeName string, property map[string]interface{}, uiType string, description string, isPrimary bool, isHidden bool) (map[string]interface{}, error) {
 	if isPrimary {
-		return nil, fmt.Errorf("base/v3 does not support setting primary field in field body")
+		return nil, errs.NewValidationError(errs.SubtypeFailedPrecondition, "base/v3 does not support setting primary field in field body")
 	}
 	if isHidden {
-		return nil, fmt.Errorf("base/v3 does not support hidden field creation in field body")
+		return nil, errs.NewValidationError(errs.SubtypeFailedPrecondition, "base/v3 does not support hidden field creation in field body")
 	}
 	spec, err := resolveFieldTypeSpec(typeName)
 	if err != nil {
@@ -335,7 +357,7 @@ func buildTableFieldBodies(rawFields string, rawFieldSpecs string) ([]interface{
 	if rawFields != "" {
 		var fields []interface{}
 		if err := common.ParseJSON([]byte(rawFields), &fields); err != nil {
-			return nil, fmt.Errorf("--fields invalid JSON, must be a field definition array")
+			return nil, baseValidationErrorf("--fields invalid JSON, must be a field definition array")
 		}
 		return fields, nil
 	}
@@ -347,7 +369,7 @@ func buildTableFieldBodies(rawFields string, rawFieldSpecs string) ([]interface{
 	for _, spec := range specs {
 		body, err := buildFieldBody(spec.Name, normalizeFieldTypeName(spec.Type), nil, "", "", false, false)
 		if err != nil {
-			return nil, fmt.Errorf("field %q: %w", spec.Name, err)
+			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "field %q: %s", spec.Name, err).WithCause(err)
 		}
 		fields = append(fields, body)
 	}
@@ -366,9 +388,24 @@ func baseV3Path(parts ...string) string {
 }
 
 func baseV3Raw(runtime *common.RuntimeContext, method, path string, params map[string]interface{}, data interface{}) (map[string]interface{}, error) {
+	return baseV3RawContext(runtime.Ctx(), runtime, method, path, params, data)
+}
+
+func baseV3RawContext(ctx context.Context, runtime *common.RuntimeContext, method, path string, params map[string]interface{}, data interface{}) (map[string]interface{}, error) {
 	queryParams := make(larkcore.QueryParams)
 	for k, v := range params {
-		queryParams.Set(k, fmt.Sprintf("%v", v))
+		switch val := v.(type) {
+		case []string:
+			for _, item := range val {
+				queryParams.Add(k, item)
+			}
+		case []interface{}:
+			for _, item := range val {
+				queryParams.Add(k, fmt.Sprintf("%v", item))
+			}
+		default:
+			queryParams.Set(k, fmt.Sprintf("%v", v))
+		}
 	}
 	req := &larkcore.ApiReq{
 		HttpMethod:  strings.ToUpper(method),
@@ -378,28 +415,103 @@ func baseV3Raw(runtime *common.RuntimeContext, method, path string, params map[s
 	}
 	h := make(http.Header)
 	h.Set("X-App-Id", runtime.Config.AppID)
-	resp, err := runtime.DoAPI(req, larkcore.WithHeaders(h))
+	resp, err := runtime.DoAPIWithContext(ctx, req, larkcore.WithHeaders(h))
 	if err != nil {
-		return nil, err
+		return nil, baseAPIBoundaryError(err, "API call failed")
 	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		body := strings.TrimSpace(string(resp.RawBody))
-		if body == "" {
-			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	if _, err := runtime.ClassifyAPIResponse(resp); err != nil {
+		if statusErr := baseHTTPStatusErrorFromInvalidResponse(resp, err); statusErr != nil {
+			return nil, statusErr
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return nil, enrichBaseAPIErrorFromBody(err, resp.RawBody, runtime.APIClassifyContext())
 	}
-	var result map[string]interface{}
-	dec := json.NewDecoder(bytes.NewReader(resp.RawBody))
-	dec.UseNumber()
-	if err := dec.Decode(&result); err != nil {
-		return nil, fmt.Errorf("response parse error: %w", err)
+	result, parseErr := decodeBaseV3Response(resp.RawBody)
+	if parseErr != nil {
+		return nil, parseErr
 	}
 	return result, nil
 }
 
+func decodeBaseV3Response(body []byte) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&result); err != nil {
+		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse, "API returned an invalid JSON response: %v", err).WithCause(err)
+	}
+	if result == nil {
+		return nil, errs.NewInternalError(errs.SubtypeInvalidResponse, "API returned a non-object JSON response")
+	}
+	return result, nil
+}
+
+func attachBaseErrorLogID(result map[string]interface{}, logID string) {
+	if result == nil || strings.TrimSpace(logID) == "" {
+		return
+	}
+	logID = strings.TrimSpace(logID)
+	if detail, ok := result["error"].(map[string]interface{}); ok {
+		if _, exists := detail["logid"]; !exists {
+			detail["logid"] = logID
+		}
+		return
+	}
+	data, _ := result["data"].(map[string]interface{})
+	if data == nil {
+		data = map[string]interface{}{}
+		result["data"] = data
+	}
+	detail, _ := data["error"].(map[string]interface{})
+	if detail == nil {
+		detail = map[string]interface{}{}
+		data["error"] = detail
+	}
+	if _, exists := detail["logid"]; !exists {
+		detail["logid"] = logID
+	}
+}
+
+func baseResponseLogID(resp *larkcore.ApiResp) string {
+	if resp == nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.Header.Get("x-tt-logid"))
+}
+
+func baseHTTPStatusErrorFromInvalidResponse(resp *larkcore.ApiResp, classified error) error {
+	if resp == nil || resp.StatusCode < http.StatusBadRequest {
+		return nil
+	}
+	p, ok := errs.ProblemOf(classified)
+	if !ok || p.Category != errs.CategoryInternal || p.Subtype != errs.SubtypeInvalidResponse {
+		return nil
+	}
+	body := strings.TrimSpace(string(resp.RawBody))
+	if resp.StatusCode >= http.StatusInternalServerError {
+		err := errs.NewNetworkError(errs.SubtypeNetworkServer, "HTTP %d: %s", resp.StatusCode, body).WithCode(resp.StatusCode).WithRetryable()
+		if logID := baseResponseLogID(resp); logID != "" {
+			err = err.WithLogID(logID)
+		}
+		return err
+	}
+	subtype := errs.SubtypeUnknown
+	if resp.StatusCode == http.StatusNotFound {
+		subtype = errs.SubtypeNotFound
+	}
+	err := errs.NewAPIError(subtype, "HTTP %d: %s", resp.StatusCode, body).WithCode(resp.StatusCode)
+	if logID := baseResponseLogID(resp); logID != "" {
+		err = err.WithLogID(logID)
+	}
+	return err
+}
+
 func baseV3Call(runtime *common.RuntimeContext, method, path string, params map[string]interface{}, data interface{}) (map[string]interface{}, error) {
 	result, err := baseV3Raw(runtime, method, path, params, data)
+	return handleBaseAPIResult(result, err, "API call failed")
+}
+
+func baseV3CallContext(ctx context.Context, runtime *common.RuntimeContext, method, path string, params map[string]interface{}, data interface{}) (map[string]interface{}, error) {
+	result, err := baseV3RawContext(ctx, runtime, method, path, params, data)
 	return handleBaseAPIResult(result, err, "API call failed")
 }
 
@@ -427,6 +539,28 @@ func toInt(v interface{}) int {
 	}
 }
 
+func toIntStrict(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
 func toStringSlice(v interface{}) []string {
 	arr, ok := v.([]interface{})
 	if !ok {
@@ -443,7 +577,7 @@ func toStringSlice(v interface{}) []string {
 
 func listAllTables(runtime *common.RuntimeContext, baseToken string, offset, limit int) ([]map[string]interface{}, int, error) {
 	if limit <= 0 {
-		return nil, 0, fmt.Errorf("limit must be greater than 0")
+		return nil, 0, errs.NewInternalError(errs.SubtypeSDKError, "limit must be greater than 0")
 	}
 	data, err := baseV3Call(runtime, "GET", baseV3Path("bases", baseToken, "tables"), map[string]interface{}{"offset": offset, "limit": limit}, nil)
 	if err != nil {
@@ -473,7 +607,7 @@ func listAllTables(runtime *common.RuntimeContext, baseToken string, offset, lim
 
 func listAllFields(runtime *common.RuntimeContext, baseToken, tableID string, offset, limit int) ([]map[string]interface{}, int, error) {
 	if limit <= 0 {
-		return nil, 0, fmt.Errorf("limit must be greater than 0")
+		return nil, 0, errs.NewInternalError(errs.SubtypeSDKError, "limit must be greater than 0")
 	}
 	data, err := baseV3Call(runtime, "GET", baseV3Path("bases", baseToken, "tables", tableID, "fields"), map[string]interface{}{"offset": offset, "limit": limit}, nil)
 	if err != nil {
@@ -495,7 +629,7 @@ func listAllFields(runtime *common.RuntimeContext, baseToken, tableID string, of
 
 func listAllViews(runtime *common.RuntimeContext, baseToken, tableID string, offset, limit int) ([]map[string]interface{}, int, error) {
 	if limit <= 0 {
-		return nil, 0, fmt.Errorf("limit must be greater than 0")
+		return nil, 0, errs.NewInternalError(errs.SubtypeSDKError, "limit must be greater than 0")
 	}
 	data, err := baseV3Call(runtime, "GET", baseV3Path("bases", baseToken, "tables", tableID, "views"), map[string]interface{}{"offset": offset, "limit": limit}, nil)
 	if err != nil {
@@ -521,7 +655,7 @@ func resolveFieldRef(fields []map[string]interface{}, ref string) (map[string]in
 			return field, nil
 		}
 	}
-	return nil, fmt.Errorf("field %q not found", ref)
+	return nil, errs.NewValidationError(errs.SubtypeFailedPrecondition, "field %q not found", ref)
 }
 
 func resolveTableRef(tables []map[string]interface{}, ref string) (map[string]interface{}, error) {
@@ -530,7 +664,7 @@ func resolveTableRef(tables []map[string]interface{}, ref string) (map[string]in
 			return table, nil
 		}
 	}
-	return nil, fmt.Errorf("table %q not found", ref)
+	return nil, errs.NewValidationError(errs.SubtypeFailedPrecondition, "table %q not found", ref)
 }
 
 func resolveViewRef(views []map[string]interface{}, ref string) (map[string]interface{}, error) {
@@ -539,31 +673,7 @@ func resolveViewRef(views []map[string]interface{}, ref string) (map[string]inte
 			return view, nil
 		}
 	}
-	return nil, fmt.Errorf("view %q not found", ref)
-}
-
-func normalizeRecordInputs(raw string) ([]map[string]interface{}, error) {
-	var records []interface{}
-	if err := common.ParseJSON([]byte(raw), &records); err != nil {
-		return nil, fmt.Errorf("--records invalid JSON, must be a record array")
-	}
-	result := make([]map[string]interface{}, 0, len(records))
-	for idx, item := range records {
-		record, ok := item.(map[string]interface{})
-		if !ok {
-			return nil, fmt.Errorf("record %d must be an object", idx+1)
-		}
-		if fields, ok := record["fields"].(map[string]interface{}); ok {
-			normalized := map[string]interface{}{"fields": fields}
-			if recordID, ok := record["record_id"].(string); ok && recordID != "" {
-				normalized["record_id"] = recordID
-			}
-			result = append(result, normalized)
-			continue
-		}
-		result = append(result, map[string]interface{}{"fields": record})
-	}
-	return result, nil
+	return nil, errs.NewValidationError(errs.SubtypeFailedPrecondition, "view %q not found", ref)
 }
 
 func chunkRecords(records []map[string]interface{}, size int) [][]map[string]interface{} {
@@ -651,45 +761,6 @@ func viewName(view map[string]interface{}) string {
 	return v
 }
 
-func viewType(view map[string]interface{}) string {
-	if v, _ := view["type"].(string); v != "" {
-		return v
-	}
-	v, _ := view["view_type"].(string)
-	return v
-}
-
-func simplifyFields(fields []map[string]interface{}) []interface{} {
-	items := make([]interface{}, 0, len(fields))
-	for _, field := range fields {
-		entry := map[string]interface{}{
-			"field_id":   fieldID(field),
-			"field_name": fieldName(field),
-			"type":       fieldTypeName(field),
-		}
-		if style, ok := field["style"].(map[string]interface{}); ok && len(style) > 0 {
-			entry["style"] = style
-		}
-		if multiple, ok := field["multiple"].(bool); ok {
-			entry["multiple"] = multiple
-		}
-		items = append(items, entry)
-	}
-	return items
-}
-
-func simplifyViews(views []map[string]interface{}) []interface{} {
-	items := make([]interface{}, 0, len(views))
-	for _, view := range views {
-		items = append(items, map[string]interface{}{
-			"view_id":   viewID(view),
-			"view_name": viewName(view),
-			"view_type": viewType(view),
-		})
-	}
-	return items
-}
-
 func canonicalValue(v interface{}) string {
 	switch val := v.(type) {
 	case nil:
@@ -719,18 +790,18 @@ func canonicalValue(v interface{}) string {
 func parseNamedTypeSpecs(raw string, flagName string) ([]namedTypeSpec, error) {
 	var tuples []interface{}
 	if err := common.ParseJSON([]byte(raw), &tuples); err != nil {
-		return nil, fmt.Errorf("--%s invalid JSON array", flagName)
+		return nil, baseValidationErrorf("--%s invalid JSON array", flagName)
 	}
 	result := make([]namedTypeSpec, 0, len(tuples))
 	for idx, item := range tuples {
 		pair, ok := item.([]interface{})
 		if !ok || len(pair) != 2 {
-			return nil, fmt.Errorf("--%s item %d must be [name, type]", flagName, idx+1)
+			return nil, baseValidationErrorf("--%s item %d must be [name, type]", flagName, idx+1)
 		}
 		name, ok1 := pair[0].(string)
 		typeName, ok2 := pair[1].(string)
 		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("--%s item %d must be [string, string]", flagName, idx+1)
+			return nil, baseValidationErrorf("--%s item %d must be [string, string]", flagName, idx+1)
 		}
 		result = append(result, namedTypeSpec{Name: name, Type: typeName})
 	}
@@ -969,161 +1040,4 @@ func sleepBetweenBatches(index int, total int) {
 	if index < total-1 {
 		time.Sleep(600 * time.Millisecond)
 	}
-}
-
-// ── Dashboard Block data_config normalization & validation ───────────
-
-func normalizeDataConfig(cfg map[string]interface{}) map[string]interface{} {
-	if cfg == nil {
-		return nil
-	}
-	out := cloneMap(cfg)
-	// series[].rollup → 大写
-	if arr, ok := out["series"].([]interface{}); ok {
-		for i, it := range arr {
-			if m, ok := it.(map[string]interface{}); ok {
-				if r, ok := m["rollup"].(string); ok && r != "" {
-					m["rollup"] = strings.ToUpper(strings.TrimSpace(r))
-				}
-				arr[i] = m
-			}
-		}
-		out["series"] = arr
-	}
-	// group_by.sort 的 type/order → 小写
-	if gb, ok := out["group_by"].([]interface{}); ok {
-		for i, g := range gb {
-			if m, ok := g.(map[string]interface{}); ok {
-				if md, ok := m["mode"].(string); ok {
-					m["mode"] = strings.ToLower(strings.TrimSpace(md))
-				}
-				if sub, ok := m["sort"].(map[string]interface{}); ok {
-					if t, ok := sub["type"].(string); ok {
-						sub["type"] = strings.ToLower(strings.TrimSpace(t))
-					}
-					if o, ok := sub["order"].(string); ok {
-						sub["order"] = strings.ToLower(strings.TrimSpace(o))
-					}
-					m["sort"] = sub
-				}
-				gb[i] = m
-			}
-		}
-		out["group_by"] = gb
-	}
-	return out
-}
-
-func validateBlockDataConfig(blockType string, cfg map[string]interface{}) []string {
-	var errs []string
-	// table_name 必填
-	if tn, _ := cfg["table_name"].(string); strings.TrimSpace(tn) == "" {
-		errs = append(errs, "缺少必填字段 table_name")
-	}
-	// series 与 count_all 互斥且必有其一
-	_, hasSeries := cfg["series"]
-	_, hasCountAll := cfg["count_all"]
-	if !(hasSeries || hasCountAll) {
-		errs = append(errs, "series 与 count_all 二选一，至少提供其一")
-	}
-	if hasSeries && hasCountAll {
-		errs = append(errs, "series 与 count_all 互斥，不可同时存在")
-	}
-	// series 校验
-	if hasSeries {
-		arr, ok := cfg["series"].([]interface{})
-		if !ok || len(arr) == 0 {
-			errs = append(errs, "series 必须是非空数组")
-		} else {
-			// rollup 支持：SUM / MAX / MIN / AVERAGE（不支持 COUNTA；计数请使用 count_all）
-			allowed := map[string]bool{"SUM": true, "MAX": true, "MIN": true, "AVERAGE": true}
-			for i, it := range arr {
-				m, ok := it.(map[string]interface{})
-				if !ok {
-					errs = append(errs, fmt.Sprintf("series[%d] 必须是对象", i))
-					continue
-				}
-				fn, _ := m["field_name"].(string)
-				if strings.TrimSpace(fn) == "" {
-					errs = append(errs, fmt.Sprintf("series[%d].field_name 不能为空", i))
-				}
-				r, _ := m["rollup"].(string)
-				r = strings.ToUpper(strings.TrimSpace(r))
-				if !allowed[r] {
-					errs = append(errs, fmt.Sprintf("series[%d].rollup 不在允许枚举内: %s", i, r))
-				}
-			}
-		}
-	}
-	// group_by 最多 2 个，字段名必填，sort 合法
-	if gb, ok := cfg["group_by"].([]interface{}); ok {
-		if len(gb) > 2 {
-			errs = append(errs, "group_by 最多支持 2 个维度")
-		}
-		for i, g := range gb {
-			m, ok := g.(map[string]interface{})
-			if !ok {
-				errs = append(errs, fmt.Sprintf("group_by[%d] 必须是对象", i))
-				continue
-			}
-			fn, _ := m["field_name"].(string)
-			if strings.TrimSpace(fn) == "" {
-				errs = append(errs, fmt.Sprintf("group_by[%d].field_name 不能为空", i))
-			}
-			if sub, ok := m["sort"].(map[string]interface{}); ok {
-				t, _ := sub["type"].(string)
-				t = strings.ToLower(strings.TrimSpace(t))
-				o, _ := sub["order"].(string)
-				o = strings.ToLower(strings.TrimSpace(o))
-				if t != "group" && t != "value" && t != "view" {
-					errs = append(errs, fmt.Sprintf("group_by[%d].sort.type 仅支持 group|value|view", i))
-				}
-				if o != "asc" && o != "desc" {
-					errs = append(errs, fmt.Sprintf("group_by[%d].sort.order 仅支持 asc|desc", i))
-				}
-			}
-		}
-	}
-	// filter 基本结构
-	if f, ok := cfg["filter"].(map[string]interface{}); ok {
-		conj := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", f["conjunction"])))
-		if conj == "" {
-			conj = "and"
-		}
-		if conj != "and" && conj != "or" {
-			errs = append(errs, "filter.conjunction 仅支持 and|or")
-		}
-		if conds, ok := f["conditions"].([]interface{}); ok {
-			allowedOps := map[string]bool{"is": true, "isnot": true, "contains": true, "doesnotcontain": true, "isempty": true, "isnotempty": true, "isgreater": true, "isgreaterequal": true, "isless": true, "islessequal": true}
-			for i, it := range conds {
-				m, ok := it.(map[string]interface{})
-				if !ok {
-					errs = append(errs, fmt.Sprintf("filter.conditions[%d] 必须是对象", i))
-					continue
-				}
-				fn, _ := m["field_name"].(string)
-				if strings.TrimSpace(fn) == "" {
-					errs = append(errs, fmt.Sprintf("filter.conditions[%d].field_name 不能为空", i))
-				}
-				op, _ := m["operator"].(string)
-				key := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(op), " ", ""))
-				if !allowedOps[key] {
-					errs = append(errs, fmt.Sprintf("filter.conditions[%d].operator 不支持: %s", i, op))
-				}
-				if key != "isempty" && key != "isnotempty" {
-					if _, has := m["value"]; !has {
-						errs = append(errs, fmt.Sprintf("filter.conditions[%d].value 缺失", i))
-					}
-				}
-			}
-		}
-	}
-	return errs
-}
-
-func formatDataConfigErrors(errs []string) error {
-	if len(errs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("data_config 校验失败:\n- %s\n参考: skills/lark-base/references/dashboard-block-data-config.md", strings.Join(errs, "\n- "))
 }

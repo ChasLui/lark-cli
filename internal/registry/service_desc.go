@@ -6,6 +6,7 @@ package registry
 import (
 	_ "embed"
 	"encoding/json"
+	"sort"
 )
 
 //go:embed service_descriptions.json
@@ -19,8 +20,9 @@ type serviceDescLocale struct {
 
 // serviceDescEntry holds bilingual descriptions for a service domain.
 type serviceDescEntry struct {
-	En serviceDescLocale `json:"en"`
-	Zh serviceDescLocale `json:"zh"`
+	En         serviceDescLocale `json:"en"`
+	Zh         serviceDescLocale `json:"zh"`
+	AuthDomain string            `json:"auth_domain,omitempty"`
 }
 
 var serviceDescMap map[string]serviceDescEntry
@@ -32,6 +34,19 @@ func loadServiceDescriptions() map[string]serviceDescEntry {
 	serviceDescMap = make(map[string]serviceDescEntry)
 	_ = json.Unmarshal(serviceDescJSON, &serviceDescMap)
 	return serviceDescMap
+}
+
+// AllServiceNames returns every configured service domain, sorted. It covers
+// domains served only by typed or raw API commands, so it is a superset of the
+// domains reachable through shortcuts.
+func AllServiceNames() []string {
+	m := loadServiceDescriptions()
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func getServiceLocale(name, lang string) *serviceDescLocale {
@@ -67,12 +82,30 @@ func GetServiceTitle(name, lang string) string {
 	return loc.Title
 }
 
-// GetServiceDetailDescription returns the localized detail description for a service domain.
-// Returns empty string if not found.
-func GetServiceDetailDescription(name, lang string) string {
-	loc := getServiceLocale(name, lang)
-	if loc == nil {
-		return ""
+// GetAuthDomain returns the auth_domain for a service, or "" if not set.
+// When auth_domain is set, the service's scopes are collected under the
+// parent domain during auth login.
+func GetAuthDomain(service string) string {
+	m := loadServiceDescriptions()
+	if entry, ok := m[service]; ok {
+		return entry.AuthDomain
 	}
-	return loc.Description
+	return ""
+}
+
+// HasAuthDomain reports whether the service has an auth_domain configured.
+func HasAuthDomain(service string) bool {
+	return GetAuthDomain(service) != ""
+}
+
+// GetAuthChildren returns all service names whose auth_domain equals parent.
+func GetAuthChildren(parent string) []string {
+	m := loadServiceDescriptions()
+	var children []string
+	for name, entry := range m {
+		if entry.AuthDomain == parent {
+			children = append(children, name)
+		}
+	}
+	return children
 }

@@ -4,10 +4,13 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
+	"github.com/larksuite/cli/errs"
 	larkauth "github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
 	"github.com/larksuite/cli/internal/core"
@@ -17,6 +20,7 @@ import (
 // LogoutOptions holds all inputs for auth logout.
 type LogoutOptions struct {
 	Factory *cmdutil.Factory
+	JSON    bool
 }
 
 // NewCmdAuthLogout creates the auth logout subcommand.
@@ -33,6 +37,8 @@ func NewCmdAuthLogout(f *cmdutil.Factory, runF func(*LogoutOptions) error) *cobr
 			return authLogoutRun(opts)
 		},
 	}
+	cmd.Flags().BoolVar(&opts.JSON, "json", false, "structured JSON output")
+	cmdutil.SetRisk(cmd, "write")
 
 	return cmd
 }
@@ -40,26 +46,80 @@ func NewCmdAuthLogout(f *cmdutil.Factory, runF func(*LogoutOptions) error) *cobr
 func authLogoutRun(opts *LogoutOptions) error {
 	f := opts.Factory
 
-	multi, _ := core.LoadMultiAppConfig()
+	multi, err := core.LoadMultiAppConfig()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		subtype := errs.SubtypeNotConfigured
+		if errors.Is(err, core.ErrMalformedConfig) {
+			subtype = errs.SubtypeInvalidConfig
+		}
+		return errs.NewConfigError(subtype, "failed to load config: %v", err).WithCause(err)
+	}
 	if multi == nil || len(multi.Apps) == 0 {
+		if opts.JSON {
+			output.PrintJson(f.IOStreams.Out, map[string]interface{}{
+				"ok":        true,
+				"loggedOut": false,
+				"reason":    "not_configured",
+			})
+			return nil
+		}
 		fmt.Fprintln(f.IOStreams.ErrOut, "No configuration found.")
 		return nil
 	}
 
-	app := &multi.Apps[0]
+	// A selector that matches no profile is an input error, not a logged-out
+	// state: "not_logged_in" (exit 0) would hide a stale --profile or
+	// LARKSUITE_CLI_PROFILE value from the caller.
+	app, err := multi.RequireAppConfig(f.Invocation.Profile, f.Invocation.ProfileSource)
+	if err != nil {
+		return err
+	}
 	if len(app.Users) == 0 {
+		if opts.JSON {
+			output.PrintJson(f.IOStreams.Out, map[string]interface{}{
+				"ok":        true,
+				"loggedOut": false,
+				"reason":    "not_logged_in",
+			})
+			return nil
+		}
 		fmt.Fprintln(f.IOStreams.ErrOut, "Not logged in.")
 		return nil
 	}
 
+	httpClient, httpErr := f.HttpClient()
+	appSecret, secretErr := core.ResolveSecretInput(app.AppSecret, f.Keychain)
+
 	for _, user := range app.Users {
+		if httpErr == nil && secretErr == nil {
+			token, _ := larkauth.GetStoredToken(app.AppId, user.UserOpenId)
+			if token != nil {
+				revokeToken := token.RefreshToken
+				tokenTypeHint := "refresh_token"
+				if revokeToken == "" {
+					revokeToken = token.AccessToken
+					tokenTypeHint = "access_token"
+				}
+				if revokeToken != "" {
+					_ = larkauth.RevokeToken(httpClient, app.AppId, appSecret, app.Brand, revokeToken, tokenTypeHint)
+				}
+			}
+		}
 		if err := larkauth.RemoveStoredToken(app.AppId, user.UserOpenId); err != nil {
 			fmt.Fprintf(f.IOStreams.ErrOut, "Warning: failed to remove token for %s: %v\n", user.UserOpenId, err)
 		}
 	}
+
 	app.Users = []core.AppUser{}
 	if err := core.SaveMultiAppConfig(multi); err != nil {
-		return output.Errorf(output.ExitInternal, "internal", "failed to save config: %v", err)
+		return errs.NewInternalError(errs.SubtypeStorage, "failed to save config: %v", err).WithCause(err)
+	}
+	if opts.JSON {
+		output.PrintJson(f.IOStreams.Out, map[string]interface{}{
+			"ok":        true,
+			"loggedOut": true,
+		})
+		return nil
 	}
 	output.PrintSuccess(f.IOStreams.ErrOut, "Logged out")
 	return nil

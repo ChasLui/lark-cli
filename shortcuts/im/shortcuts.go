@@ -9,14 +9,28 @@ import "github.com/larksuite/cli/shortcuts/common"
 func Shortcuts() []common.Shortcut {
 	return []common.Shortcut{
 		ImChatCreate,
+		ImChatList,
+		ImChatMembersList,
 		ImChatMessageList,
 		ImChatSearch,
 		ImChatUpdate,
+		ImMessageReadUsers,
+		ImMessagesEdit,
 		ImMessagesMGet,
+		ImMessagesReadStatus,
 		ImMessagesReply,
 		ImMessagesResourcesDownload,
 		ImMessagesSearch,
 		ImMessagesSend,
 		ImThreadsMessagesList,
+		ImFlagCreate,
+		ImFlagCancel,
+		ImFlagList,
+		ImFeedShortcutCreate,
+		ImFeedShortcutRemove,
+		ImFeedShortcutList,
+		ImFeedGroupList,
+		ImFeedGroupListItem,
+		ImFeedGroupQueryItem,
 	}
 }

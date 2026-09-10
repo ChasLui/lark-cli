@@ -5,22 +5,16 @@ package doc
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
-	"os"
+	"io"
 	"path/filepath"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-
-	"github.com/larksuite/cli/internal/output"
-	"github.com/larksuite/cli/internal/util"
-	"github.com/larksuite/cli/internal/validate"
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/extension/fileio"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
-var MediaUpload = common.Shortcut{
+var DocMediaUpload = common.Shortcut{
 	Service:     "docs",
 	Command:     "+media-upload",
 	Description: "Upload media file (image/attachment) to a document block",
@@ -28,103 +22,85 @@ var MediaUpload = common.Shortcut{
 	Scopes:      []string{"docs:document.media:upload"},
 	AuthTypes:   []string{"user", "bot"},
 	Flags: []common.Flag{
-		{Name: "file", Desc: "local file path (max 20MB)", Required: true},
-		{Name: "parent-type", Desc: "parent type: docx_image | docx_file", Required: true},
-		{Name: "parent-node", Desc: "parent node ID (block_id)", Required: true},
+		{Name: "file", Desc: "local file path (files > 20MB use multipart upload automatically)", Required: true},
+		{Name: "parent-type", Desc: "parent type: docx_image | docx_file | whiteboard | mindnote_image (local Office Word tokens automatically use office_docx_file)", Required: true},
+		{Name: "parent-node", Desc: "parent node ID (block_id for docx, board_token for whiteboard, mindnote token for mindnote)", Required: true},
 		{Name: "doc-id", Desc: "document ID (for drive_route_token)"},
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		filePath := runtime.Str("file")
-		parentType := runtime.Str("parent-type")
 		parentNode := runtime.Str("parent-node")
+		parentType := docMediaParentType(runtime.Str("parent-type"), parentNode)
 		docId := runtime.Str("doc-id")
 		body := map[string]interface{}{
 			"file_name":   filepath.Base(filePath),
 			"parent_type": parentType,
 			"parent_node": parentNode,
-			"file":        "@" + filePath,
 		}
 		if docId != "" {
 			body["extra"] = fmt.Sprintf(`{"drive_route_token":"%s"}`, docId)
 		}
-		return common.NewDryRunAPI().
-			Desc("multipart/form-data upload").
+		dry := common.NewDryRunAPI()
+		if docMediaShouldUseMultipart(runtime.FileIO(), filePath) {
+			prepareBody := map[string]interface{}{
+				"file_name":   filepath.Base(filePath),
+				"parent_type": parentType,
+				"parent_node": parentNode,
+				"size":        "<file_size>",
+			}
+			if extra, ok := body["extra"]; ok {
+				prepareBody["extra"] = extra
+			}
+			dry.Desc("chunked media upload (files > 20MB)").
+				POST("/open-apis/drive/v1/medias/upload_prepare").
+				Body(prepareBody).
+				POST("/open-apis/drive/v1/medias/upload_part").
+				Body(map[string]interface{}{
+					"upload_id": "<upload_id>",
+					"seq":       "<chunk_index>",
+					"size":      "<chunk_size>",
+					"file":      "<chunk_binary>",
+				}).
+				POST("/open-apis/drive/v1/medias/upload_finish").
+				Body(map[string]interface{}{
+					"upload_id": "<upload_id>",
+					"block_num": "<block_num>",
+				})
+			return dry
+		}
+
+		body["file"] = "@" + filePath
+		body["size"] = "<file_size>"
+		return dry.Desc("multipart/form-data upload").
 			POST("/open-apis/drive/v1/medias/upload_all").
 			Body(body)
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		filePath := runtime.Str("file")
-		parentType := runtime.Str("parent-type")
 		parentNode := runtime.Str("parent-node")
+		parentType := docMediaParentType(runtime.Str("parent-type"), parentNode)
 		docId := runtime.Str("doc-id")
 
-		safeFilePath, pathErr := validate.SafeInputPath(filePath)
-		if pathErr != nil {
-			return output.ErrValidation("unsafe file path: %s", pathErr)
-		}
-		filePath = safeFilePath
-
 		// Validate file
-		stat, err := os.Stat(filePath)
+		stat, err := runtime.FileIO().Stat(filePath)
 		if err != nil {
-			return output.ErrValidation("file not found: %s", filePath)
+			return wrapDocInputFileErr(err, "file not found")
 		}
-		if stat.Size() > maxFileSize {
-			return output.ErrValidation("file %.1fMB exceeds 20MB limit", float64(stat.Size())/1024/1024)
+		if !stat.Mode().IsRegular() {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "file must be a regular file: %s", filePath).WithParam("--file")
 		}
 
 		fileName := filepath.Base(filePath)
-		fmt.Fprintf(runtime.IO().ErrOut, "Uploading: %s (%d bytes)\n", fileName, stat.Size())
-
-		f, err := os.Open(filePath)
+		fileToken, err := uploadDocMediaFile(runtime, UploadDocMediaFileConfig{
+			FilePath:   filePath,
+			FileName:   fileName,
+			FileSize:   stat.Size(),
+			ParentType: parentType,
+			ParentNode: parentNode,
+			DocID:      docId,
+		})
 		if err != nil {
-			return output.ErrValidation("cannot open file: %v", err)
-		}
-		defer f.Close()
-
-		// Build SDK Formdata
-		fd := larkcore.NewFormdata()
-		fd.AddField("file_name", fileName)
-		fd.AddField("parent_type", parentType)
-		fd.AddField("parent_node", parentNode)
-		fd.AddField("size", fmt.Sprintf("%d", stat.Size()))
-		if docId != "" {
-			extra, err := buildDriveRouteExtra(docId)
-			if err != nil {
-				return err
-			}
-			fd.AddField("extra", extra)
-		}
-		fd.AddFile("file", f)
-
-		apiResp, err := runtime.DoAPI(&larkcore.ApiReq{
-			HttpMethod: http.MethodPost,
-			ApiPath:    "/open-apis/drive/v1/medias/upload_all",
-			Body:       fd,
-		}, larkcore.WithFileUpload())
-		if err != nil {
-			var exitErr *output.ExitError
-			if errors.As(err, &exitErr) {
-				return err
-			}
-			return output.ErrNetwork("upload failed: %v", err)
-		}
-
-		var result map[string]interface{}
-		if err := json.Unmarshal(apiResp.RawBody, &result); err != nil {
-			return output.Errorf(output.ExitAPI, "api_error", "upload failed: invalid response JSON: %v", err)
-		}
-
-		code, _ := util.ToFloat64(result["code"])
-		if code != 0 {
-			msg, _ := result["msg"].(string)
-			return output.ErrAPI(int(code), fmt.Sprintf("upload failed: [%d] %s", int(code), msg), result["error"])
-		}
-
-		data, _ := result["data"].(map[string]interface{})
-		fileToken, _ := data["file_token"].(string)
-		if fileToken == "" {
-			return output.Errorf(output.ExitAPI, "api_error", "upload failed: no file_token returned")
+			return err
 		}
 
 		runtime.Out(map[string]interface{}{
@@ -134,4 +110,88 @@ var MediaUpload = common.Shortcut{
 		}, nil)
 		return nil
 	},
+}
+
+const (
+	officeDocxFileParentType = "office_docx_file"
+	localOfficeWordType      = byte('W')
+)
+
+// Local Word media uploads use a dedicated Drive mount point.
+func docMediaParentType(parentType, parentNode string) string {
+	if !isLocalWordToken(parentNode) {
+		return parentType
+	}
+	return officeDocxFileParentType
+}
+
+func isLocalWordToken(token string) bool {
+	return common.IsLocalOfficeToken(token) && len(token) > 0 && token[len(token)-1] == localOfficeWordType
+}
+
+// UploadDocMediaFileConfig groups the inputs to uploadDocMediaFile so the
+// call site names each value at call time, avoiding the "8 positional
+// params of mostly string/int64" ambiguity and mirroring the config-struct
+// style already used by DriveMediaUploadAllConfig /
+// DriveMediaMultipartUploadConfig downstream.
+//
+// Exactly one of FilePath (on-disk source) or Reader (in-memory source for
+// the clipboard flow) should be set. Leave Reader at its zero value (nil
+// interface) when the caller only has FilePath — passing a typed-nil
+// pointer like (*bytes.Reader)(nil) here would make Reader compare
+// non-nil downstream and skip the FilePath open, so the field type is
+// deliberately an interface and the clipboard caller builds it only when
+// it actually has bytes.
+type UploadDocMediaFileConfig struct {
+	FilePath   string
+	Reader     io.Reader
+	FileName   string
+	FileSize   int64
+	ParentType string
+	ParentNode string
+	DocID      string
+}
+
+func uploadDocMediaFile(runtime *common.RuntimeContext, cfg UploadDocMediaFileConfig) (string, error) {
+	var extra string
+	if cfg.DocID != "" {
+		var err error
+		extra, err = buildDriveRouteExtra(cfg.DocID)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Doc media uploads share the generic Drive media transport. The doc-specific
+	// routing only shows up in parent_type/parent_node and optional route extra.
+	if cfg.FileSize <= common.MaxDriveMediaUploadSinglePartSize {
+		return common.UploadDriveMediaAllTyped(runtime, common.DriveMediaUploadAllConfig{
+			FilePath:   cfg.FilePath,
+			Reader:     cfg.Reader,
+			FileName:   cfg.FileName,
+			FileSize:   cfg.FileSize,
+			ParentType: cfg.ParentType,
+			ParentNode: &cfg.ParentNode,
+			Extra:      extra,
+		})
+	}
+	return common.UploadDriveMediaMultipartTyped(runtime, common.DriveMediaMultipartUploadConfig{
+		FilePath:   cfg.FilePath,
+		Reader:     cfg.Reader,
+		FileName:   cfg.FileName,
+		FileSize:   cfg.FileSize,
+		ParentType: cfg.ParentType,
+		ParentNode: cfg.ParentNode,
+		Extra:      extra,
+	})
+}
+
+func docMediaShouldUseMultipart(fio fileio.FileIO, filePath string) bool {
+	// Dry-run uses local stat as a best-effort planning hint. Execute re-validates
+	// the file before choosing the actual upload path.
+	info, err := fio.Stat(filePath)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Size() > common.MaxDriveMediaUploadSinglePartSize
 }

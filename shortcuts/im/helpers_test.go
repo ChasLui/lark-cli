@@ -4,17 +4,19 @@
 package im
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/shortcuts/common"
+	"github.com/spf13/cobra"
 )
 
 func TestNormalizeAtMentions(t *testing.T) {
@@ -46,6 +48,56 @@ func TestDetectIMFileType(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := detectIMFileType(tt.path); got != tt.want {
 				t.Fatalf("detectIMFileType(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateAudioMessageInput(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "empty", value: ""},
+		{name: "existing file key", value: "file_abc"},
+		{name: "opus file", value: "./voice.opus"},
+		{name: "ogg opus file", value: "./voice.ogg"},
+		{name: "uppercase opus", value: "./VOICE.OPUS"},
+		{name: "mp3 local file", value: "./voice.mp3", wantErr: true},
+		{name: "wav local file", value: "./voice.wav", wantErr: true},
+		{name: "extensionless local path", value: "./voice"},
+		{name: "opus url", value: "https://example.com/voice.opus?download=1"},
+		{name: "ogg url", value: "https://example.com/voice.ogg?download=1"},
+		{name: "mp3 url", value: "https://example.com/voice.mp3?download=1", wantErr: true},
+		{name: "extensionless url", value: "https://example.com/download?id=1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAudioMessageInput("--audio", tt.value)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "--audio supports only Opus audio files") {
+					t.Fatalf("validateAudioMessageInput(%q) error = %v", tt.value, err)
+				}
+				p, ok := errs.ProblemOf(err)
+				if !ok {
+					t.Fatalf("validateAudioMessageInput(%q) error is not typed: %v", tt.value, err)
+				}
+				if p.Category != errs.CategoryValidation || p.Subtype != errs.SubtypeInvalidArgument {
+					t.Fatalf("ProblemOf(%q) = category %q subtype %q", tt.value, p.Category, p.Subtype)
+				}
+				validationErr, ok := err.(*errs.ValidationError)
+				if !ok || validationErr.Param != "--audio" {
+					t.Fatalf("validateAudioMessageInput(%q) param = %q, want --audio", tt.value, validationErr.Param)
+				}
+				if !strings.Contains(p.Hint, "use --file") || !strings.Contains(p.Hint, "ffmpeg") {
+					t.Fatalf("validateAudioMessageInput(%q) hint = %q, want --file and ffmpeg guidance", tt.value, p.Hint)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateAudioMessageInput(%q) unexpected error = %v", tt.value, err)
 			}
 		})
 	}
@@ -131,6 +183,7 @@ func TestBuildMediaContentFromKey(t *testing.T) {
 	}
 }
 
+// TestWrapMarkdownAsPostForDryRun covers markdown-to-post wrapping used by dry runs.
 func TestWrapMarkdownAsPostForDryRun(t *testing.T) {
 	content, desc := wrapMarkdownAsPostForDryRun("hello ![alt](https://example.com/a.png)")
 	if !strings.Contains(content, `![alt](img_dryrun_1)`) {
@@ -138,6 +191,160 @@ func TestWrapMarkdownAsPostForDryRun(t *testing.T) {
 	}
 	if !strings.Contains(desc, "placeholder image keys") {
 		t.Fatalf("wrapMarkdownAsPostForDryRun() desc = %q, want placeholder note", desc)
+	}
+}
+
+// TestParseAttachmentFlag covers bare key parsing and empty-value rejection.
+func TestParseAttachmentFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantKey string
+		wantErr bool
+	}{
+		{name: "key only", value: "file_123", wantKey: "file_123"},
+		{name: "whitespace trimmed", value: "  file_123  ", wantKey: "file_123"},
+		{name: "empty", value: "   ", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseAttachmentFlag(tt.value, "--attachment")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseAttachmentFlag(%q) expected error, got %#v", tt.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAttachmentFlag(%q) unexpected error: %v", tt.value, err)
+			}
+			if got.Key != tt.wantKey {
+				t.Fatalf("parseAttachmentFlag(%q) = %+v, want key=%q", tt.value, got, tt.wantKey)
+			}
+		})
+	}
+}
+
+// TestParseAttachments parses repeated values in order.
+
+func TestParseAttachments(t *testing.T) {
+	got, err := parseAttachments([]string{"file_1", "file_2"}, "--attachment")
+	if err != nil {
+		t.Fatalf("parseAttachments unexpected error: %v", err)
+	}
+	if len(got) != 2 || got[0].Key != "file_1" || got[1].Key != "file_2" {
+		t.Fatalf("parseAttachments() = %+v, want 2 items with keys set", got)
+	}
+	// TestMergeAttachmentsIntoPostContent merges files into post content top-level, preserving existing files.
+}
+
+// TestMergeAttachmentsIntoPostContent merges files into post content top-level, preserving existing files.
+func TestMergeAttachmentsIntoPostContent(t *testing.T) {
+	items := []attachmentItem{{Key: "file_1"}, {Key: "file_2"}}
+	merged, err := mergeAttachmentsIntoPostContent(`{"zh_cn":{"content":[[{"tag":"text","text":"hi"}]]}}`, items)
+	if err != nil {
+		t.Fatalf("mergeAttachmentsIntoPostContent unexpected error: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(merged), &parsed); err != nil {
+		t.Fatalf("merged content is not valid JSON: %v\n%s", err, merged)
+	}
+	files, ok := parsed["files"].([]interface{})
+	if !ok || len(files) != 2 {
+		t.Fatalf("merged files = %#v, want 2 entries", parsed["files"])
+	}
+	// 不信任客户端 name：files 元素只应有 key，不应带 name 字段
+	for _, f := range files {
+		m, _ := f.(map[string]interface{})
+		if _, hasName := m["name"]; hasName {
+			t.Fatalf("merged files entry must not carry client name, got %#v", m)
+		}
+	}
+	if _, ok := parsed["zh_cn"]; !ok {
+		t.Fatalf("merged content lost the post body: %s", merged)
+	}
+
+	// Pre-existing files in --content are preserved, and --attachment appends.
+	merged2, err := mergeAttachmentsIntoPostContent(`{"files":[{"key":"existing"}]}`, items)
+	if err != nil {
+		t.Fatalf("mergeAttachmentsIntoPostContent(pre) unexpected error: %v", err)
+	}
+	var parsed2 map[string]interface{}
+	_ = json.Unmarshal([]byte(merged2), &parsed2)
+	files2, _ := parsed2["files"].([]interface{})
+	if len(files2) != 3 {
+		t.Fatalf("merged files with pre-existing = %d entries, want 3", len(files2))
+	}
+
+	// JSON "null" content must not panic: treat it as empty and attach files.
+	merged3, err := mergeAttachmentsIntoPostContent("null", items)
+	if err != nil {
+		t.Fatalf("mergeAttachmentsIntoPostContent(null) unexpected error: %v", err)
+	}
+	var parsed3 map[string]interface{}
+	_ = json.Unmarshal([]byte(merged3), &parsed3)
+	files3, _ := parsed3["files"].([]interface{})
+	if len(files3) != 2 {
+		t.Fatalf("merged files with null content = %d entries, want 2", len(files3))
+	}
+
+	// Duplicate keys are deduplicated: a key already in --content is not
+	// appended again by --attachment, and repeated --attachment values collapse.
+	merged4, err := mergeAttachmentsIntoPostContent(`{"files":[{"key":"file_1"}]}`, items)
+	if err != nil {
+		t.Fatalf("mergeAttachmentsIntoPostContent(dedup) unexpected error: %v", err)
+	}
+	var parsed4 map[string]interface{}
+	_ = json.Unmarshal([]byte(merged4), &parsed4)
+	files4, _ := parsed4["files"].([]interface{})
+	if len(files4) != 2 {
+		t.Fatalf("merged files with duplicate = %d entries, want 2 (file_1, file_2)", len(files4))
+	}
+}
+
+// TestValidateAttachmentFlags covers key prefix and post-only constraints.
+// Attachments imply post: without an explicit --msg-type the type is inferred
+// as post; only an explicit incompatible --msg-type conflicts.
+func TestValidateAttachmentFlags(t *testing.T) {
+	tests := []struct {
+		name            string
+		values          []string
+		msgType         string
+		markdown        string
+		msgTypeExplicit bool
+		wantErr         bool
+		wantSub         errs.Subtype // expected validation subtype when wantErr
+		wantFlag        string       // expected --flag in the typed error
+	}{
+		{name: "post with markdown", values: []string{"file_1"}, msgType: "text", markdown: "# hi", wantErr: false},
+		{name: "post via explicit msg-type", values: []string{"file_1"}, msgType: "post", markdown: "", msgTypeExplicit: true, wantErr: false},
+		{name: "implicit msg-type infers post", values: []string{"file_1"}, msgType: "text", markdown: "", msgTypeExplicit: false, wantErr: false},
+		{name: "explicit non-post rejected", values: []string{"file_1"}, msgType: "text", markdown: "", msgTypeExplicit: true, wantErr: true, wantSub: errs.SubtypeInvalidArgument, wantFlag: "--attachment"},
+		{name: "non-file key rejected", values: []string{"img_1"}, msgType: "post", markdown: "", wantErr: true, wantSub: errs.SubtypeInvalidArgument, wantFlag: "--attachment"},
+		{name: "empty ok", values: nil, msgType: "text", markdown: "", wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateAttachmentFlags(tt.values, tt.msgType, tt.markdown, "--attachment", tt.msgTypeExplicit, "")
+			if tt.wantErr && err == nil {
+				t.Fatalf("validateAttachmentFlags() expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateAttachmentFlags() unexpected error: %v", err)
+			}
+			if tt.wantErr {
+				var ve *errs.ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("validateAttachmentFlags() error = %T, want *errs.ValidationError", err)
+				}
+				if tt.wantSub != "" && ve.Subtype != tt.wantSub {
+					t.Fatalf("validateAttachmentFlags() subtype = %q, want %q", ve.Subtype, tt.wantSub)
+				}
+				if tt.wantFlag != "" && ve.Param != tt.wantFlag {
+					t.Fatalf("validateAttachmentFlags() param = %q, want %q", ve.Param, tt.wantFlag)
+				}
+			}
+		})
 	}
 }
 
@@ -265,10 +472,13 @@ func TestParseMp4Duration(t *testing.T) {
 }
 
 func TestParseMediaDuration(t *testing.T) {
-	if got := parseMediaDuration("test.pdf", "pdf"); got != "" {
+	rt := newBotShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unexpected")
+	}))
+	if got := parseMediaDuration(rt, "test.pdf", "pdf"); got != "" {
 		t.Fatalf("parseMediaDuration(pdf) = %q, want empty", got)
 	}
-	if got := parseMediaDuration("nonexistent.opus", "opus"); got != "" {
+	if got := parseMediaDuration(rt, "nonexistent.opus", "opus"); got != "" {
 		t.Fatalf("parseMediaDuration(missing) = %q, want empty", got)
 	}
 }
@@ -446,8 +656,12 @@ func TestNormalizeDownloadOutputPath(t *testing.T) {
 		{name: "clean relative path", fileKey: "file_123", outputPath: " nested/../out.bin ", want: "out.bin"},
 		{name: "empty key", fileKey: " ", wantErr: "file-key cannot be empty"},
 		{name: "separator in key", fileKey: "dir/file", wantErr: "file-key cannot contain path separators"},
-		{name: "absolute path", fileKey: "file_123", outputPath: "/tmp/out.bin", wantErr: "absolute paths are not allowed"},
-		{name: "parent escape", fileKey: "file_123", outputPath: "../out.bin", wantErr: "path cannot escape the current working directory"},
+		// Where the path points is the built-in policy's call, made by the
+		// ResolveSavePath both call sites run next; this function only settles
+		// what the caller named. An absolute path reaching that policy is the
+		// whole point — refusing it here is what failed an agent's first call.
+		{name: "absolute path passes through", fileKey: "file_123", outputPath: "/tmp/out.bin", want: "/tmp/out.bin"},
+		{name: "parent-relative path passes through", fileKey: "file_123", outputPath: "../out.bin", want: "../out.bin"},
 		{name: "empty path after clean", fileKey: "file_123", outputPath: " . ", wantErr: "path cannot be empty"},
 	}
 
@@ -471,24 +685,88 @@ func TestNormalizeDownloadOutputPath(t *testing.T) {
 }
 
 func TestDownloadIMResourceToPathHTTPClientError(t *testing.T) {
-	runtime := &common.RuntimeContext{
-		Factory: &cmdutil.Factory{
-			HttpClient: func() (*http.Client, error) {
-				return nil, errors.New("http client unavailable")
-			},
-			IOStreams: &cmdutil.IOStreams{
-				Out:    &bytes.Buffer{},
-				ErrOut: &bytes.Buffer{},
-			},
-		},
-	}
+	// DoAPIStream now goes through APIClient, which requires a fully constructed Factory.
+	// When HttpClient returns an error, NewAPIClient fails, and getAPIClient propagates it.
+	runtime := newBotShortcutRuntime(t, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("http client unavailable")
+	}))
 
-	_, _, err := downloadIMResourceToPath(context.Background(), runtime, "om_123", "img_123", "image", "out.bin")
+	_, _, err := downloadIMResourceToPath(context.Background(), runtime, "om_123", "img_123", "image", "out.bin", true)
 	if err == nil || !strings.Contains(err.Error(), "http client unavailable") {
 		t.Fatalf("downloadIMResourceToPath() error = %v", err)
 	}
 }
 
+func TestParseContentDispositionFilename(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{name: "empty header", header: "", want: ""},
+		{name: "no filename param", header: "attachment", want: ""},
+		{name: "plain filename", header: `attachment; filename="report.xlsx"`, want: "report.xlsx"},
+		{name: "unquoted filename", header: `attachment; filename=report.xlsx`, want: "report.xlsx"},
+		{name: "RFC 5987 UTF-8 encoded", header: `attachment; filename*=UTF-8''%E5%AD%A3%E5%BA%A6%E6%8A%A5%E5%91%8A.xlsx`, want: "季度报告.xlsx"},
+		{name: "RFC 5987 takes priority over plain", header: `attachment; filename="fallback.xlsx"; filename*=UTF-8''%E5%AD%A3%E5%BA%A6%E6%8A%A5%E5%91%8A.xlsx`, want: "季度报告.xlsx"},
+		{name: "path traversal stripped", header: `attachment; filename="../../etc/passwd"`, want: "passwd"},
+		{name: "windows path stripped", header: `attachment; filename="C:\\Windows\\evil.exe"`, want: "evil.exe"},
+		{name: "control char rejected", header: "attachment; filename=\"evil\x01file.txt\"", want: ""},
+		{name: "malformed header", header: "not/valid/mime; ===", want: ""},
+		{name: "whitespace trimmed", header: `attachment; filename="  report.pdf  "`, want: "report.pdf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseContentDispositionFilename(tt.header); got != tt.want {
+				t.Fatalf("parseContentDispositionFilename(%q) = %q, want %q", tt.header, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveIMResourceDownloadPath(t *testing.T) {
+	tests := []struct {
+		name               string
+		safePath           string
+		contentType        string
+		contentDisposition string
+		preserveBasename   bool
+		want               string
+	}{
+		// safePath already has extension: always return as-is
+		{name: "user path with ext, no CD", safePath: "out.xlsx", contentType: "application/pdf", preserveBasename: true, want: "out.xlsx"},
+		{name: "user path with ext, CD present", safePath: "out.xlsx", contentDisposition: `attachment; filename="server.pdf"`, preserveBasename: true, want: "out.xlsx"},
+		// No --output: use CD filename when present
+		{name: "default path, CD filename", safePath: "file_xxx", contentDisposition: `attachment; filename="季度报告.xlsx"`, want: "季度报告.xlsx"},
+		{name: "default path, CD RFC5987", safePath: "file_xxx", contentDisposition: `attachment; filename*=UTF-8''%E5%AD%A3%E5%BA%A6%E6%8A%A5%E5%91%8A.xlsx`, want: "季度报告.xlsx"},
+		{name: "default path, no CD, MIME ext", safePath: "file_xxx", contentType: "application/pdf", want: "file_xxx.pdf"},
+		{name: "default path, no CD, unknown MIME", safePath: "file_xxx", contentType: "application/x-unknown", want: "file_xxx"},
+		{name: "default path, CD with dir component", safePath: "downloads/file_xxx", contentDisposition: `attachment; filename="report.xlsx"`, want: "downloads/report.xlsx"},
+		// User --output without extension: use CD filename's extension
+		{name: "user path no ext, CD with ext", safePath: "myfile", contentDisposition: `attachment; filename="server.pdf"`, preserveBasename: true, want: "myfile.pdf"},
+		{name: "user path no ext, CD no ext, MIME ext", safePath: "myfile", contentDisposition: `attachment; filename="noext"`, contentType: "image/png", preserveBasename: true, want: "myfile.png"},
+		{name: "user path no ext, no CD, MIME ext", safePath: "myfile", contentType: "image/jpeg", preserveBasename: true, want: "myfile.jpg"},
+		// Batch --download-resources (preserveBasename=true): the file_key basename
+		// is kept and only the extension borrowed, so two resources whose servers
+		// return the SAME Content-Disposition filename still resolve to distinct
+		// paths instead of clobbering each other.
+		{name: "batch key A, shared CD filename", safePath: "lark-im-resources/file_aaa", contentDisposition: `attachment; filename="download.bin"`, preserveBasename: true, want: "lark-im-resources/file_aaa.bin"},
+		{name: "batch key B, shared CD filename", safePath: "lark-im-resources/file_bbb", contentDisposition: `attachment; filename="download.bin"`, preserveBasename: true, want: "lark-im-resources/file_bbb.bin"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveIMResourceDownloadPath(tt.safePath, tt.contentType, tt.contentDisposition, tt.preserveBasename)
+			if got != tt.want {
+				t.Fatalf("resolveIMResourceDownloadPath() = %q, want %q", got, tt.want)
+			}
+			// TestShortcuts verifies all IM shortcuts are registered and match expected commands.
+		})
+	}
+}
+
+// TestShortcuts verifies all IM shortcuts are registered and match expected commands.
 func TestShortcuts(t *testing.T) {
 	var commands []string
 	for _, shortcut := range Shortcuts() {
@@ -497,17 +775,231 @@ func TestShortcuts(t *testing.T) {
 
 	want := []string{
 		"+chat-create",
+		"+chat-list",
+		"+chat-members-list",
 		"+chat-messages-list",
 		"+chat-search",
 		"+chat-update",
+		"+message-read-users",
+		"+messages-edit",
 		"+messages-mget",
+		"+messages-read-status",
 		"+messages-reply",
 		"+messages-resources-download",
 		"+messages-search",
 		"+messages-send",
 		"+threads-messages-list",
+		"+flag-create",
+		"+flag-cancel",
+		"+flag-list",
+		"+feed-shortcut-create",
+		"+feed-shortcut-remove",
+		"+feed-shortcut-list",
+		"+feed-group-list",
+		"+feed-group-list-item",
+		"+feed-group-query-item",
 	}
 	if !reflect.DeepEqual(commands, want) {
 		t.Fatalf("Shortcuts() commands = %#v, want %#v", commands, want)
 	}
+}
+
+// TestSenderDisplay covers the human-readable sender column: a resolved name wins,
+// otherwise the sender id is shown (AC3 fallback), and a system/senderless message
+// with neither yields an empty string (no name is normal, not an error).
+func TestSenderDisplay(t *testing.T) {
+	cases := []struct {
+		name   string
+		sender map[string]interface{}
+		want   string
+	}{
+		{"name wins", map[string]interface{}{"name": "Bot Alpha", "id": "cli_bot"}, "Bot Alpha"},
+		{"id fallback when no name (AC3)", map[string]interface{}{"id": "cli_bot", "open_bot_id": "ou_bot"}, "cli_bot"},
+		{"user id fallback", map[string]interface{}{"id": "ou_user"}, "ou_user"},
+		{"empty name falls back to id", map[string]interface{}{"name": "", "id": "cli_x"}, "cli_x"},
+		{"no name no id (system)", map[string]interface{}{"sender_type": "system"}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := senderDisplay(c.sender); got != c.want {
+				t.Fatalf("senderDisplay(%#v) = %q, want %q", c.sender, got, c.want)
+			}
+		})
+	}
+}
+
+// newSliceRuntimeContext builds a RuntimeContext supporting string and
+// string-slice flags, for validating send/reply with repeatable --attachment.
+func newSliceRuntimeContext(stringFlags map[string]string, sliceFlags map[string][]string) *common.RuntimeContext {
+	cmd := &cobra.Command{Use: "test"}
+	for name := range stringFlags {
+		cmd.Flags().String(name, "", "")
+	}
+	for name := range sliceFlags {
+		cmd.Flags().StringSlice(name, nil, "")
+	}
+	for name, val := range stringFlags {
+		_ = cmd.Flags().Set(name, val)
+	}
+	for name, vals := range sliceFlags {
+		_ = cmd.Flags().Set(name, strings.Join(vals, ","))
+	}
+	return &common.RuntimeContext{Cmd: cmd}
+}
+
+// TestSendReplyAttachmentDoesNotBypassContentValidation is the P1 regression
+// guard: --attachment must NOT swallow mutual-exclusion / media-integrity
+// errors when another content source is present (a conflicting --text or
+// --markdown was previously silently dropped).
+func TestSendReplyAttachmentDoesNotBypassContentValidation(t *testing.T) {
+	t.Run("send text+markdown+attachment rejected", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"chat-id": "oc_123", "text": "conflict", "markdown": "# wins",
+		}, map[string][]string{"attachment": {"file_1"}})
+		err := ImMessagesSend.Validate(context.Background(), rt)
+		if err == nil || (!strings.Contains(err.Error(), "cannot be specified together") && !strings.Contains(err.Error(), "cannot be combined with --text")) {
+			t.Fatalf("ImMessagesSend.Validate() = %v, want text/markdown conflict", err)
+		}
+	})
+
+	t.Run("send markdown+image+attachment rejected", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"chat-id": "oc_123", "markdown": "# wins", "image": "img_1",
+		}, map[string][]string{"attachment": {"file_1"}})
+		err := ImMessagesSend.Validate(context.Background(), rt)
+		if err == nil || !strings.Contains(err.Error(), "cannot be used with") {
+			t.Fatalf("ImMessagesSend.Validate() = %v, want media/content conflict", err)
+		}
+	})
+
+	t.Run("send attachment-only post allowed", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"chat-id": "oc_123", "msg-type": "post",
+		}, map[string][]string{"attachment": {"file_1"}})
+		if err := ImMessagesSend.Validate(context.Background(), rt); err != nil {
+			t.Fatalf("ImMessagesSend.Validate() unexpected error = %v (attachment-only post must be allowed)", err)
+		}
+	})
+
+	t.Run("reply markdown+image+attachment rejected", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"message-id": "om_1", "markdown": "# wins", "image": "img_1",
+		}, map[string][]string{"attachment": {"file_1"}})
+		err := ImMessagesReply.Validate(context.Background(), rt)
+		if err == nil || !strings.Contains(err.Error(), "cannot be used with") {
+			t.Fatalf("ImMessagesReply.Validate() = %v, want media/content conflict", err)
+		}
+	})
+
+	t.Run("reply attachment-only post allowed", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"message-id": "om_1", "msg-type": "post",
+		}, map[string][]string{"attachment": {"file_1"}})
+		if err := ImMessagesReply.Validate(context.Background(), rt); err != nil {
+			t.Fatalf("ImMessagesReply.Validate() unexpected error = %v (attachment-only reply must be allowed)", err)
+		}
+	})
+}
+
+// TestReplaceAttachmentsIntoPostContent verifies the edit "set" semantic: the
+// flag value becomes the FINAL files list, discarding --content's files and
+// never duplicating keys.
+func TestReplaceAttachmentsIntoPostContent(t *testing.T) {
+	t.Run("replaces content files, does not merge", func(t *testing.T) {
+		got, err := replaceAttachmentsIntoPostContent(`{"zh_cn":{"content":[]},"files":[{"key":"file_old"}]}`, []attachmentItem{{Key: "file_new"}})
+		if err != nil {
+			t.Fatalf("replaceAttachmentsIntoPostContent() error = %v", err)
+		}
+		var parsed map[string]interface{}
+		_ = json.Unmarshal([]byte(got), &parsed)
+		files, _ := parsed["files"].([]interface{})
+		if len(files) != 1 || files[0].(map[string]interface{})["key"] != "file_new" {
+			t.Fatalf("replace files = %#v, want only [file_new]", parsed["files"])
+		}
+		if _, ok := parsed["zh_cn"]; !ok {
+			t.Fatalf("replace lost the post body: %s", got)
+		}
+	})
+
+	t.Run("no duplicate when same key in content and flag", func(t *testing.T) {
+		got, err := replaceAttachmentsIntoPostContent(`{"zh_cn":{"content":[]},"files":[{"key":"file_old"}]}`, []attachmentItem{{Key: "file_old"}})
+		if err != nil {
+			t.Fatalf("replaceAttachmentsIntoPostContent() error = %v", err)
+		}
+		var parsed map[string]interface{}
+		_ = json.Unmarshal([]byte(got), &parsed)
+		files, _ := parsed["files"].([]interface{})
+		if len(files) != 1 {
+			t.Fatalf("replace files = %#v, want single file_old (no duplicate)", parsed["files"])
+		}
+	})
+
+	t.Run("multiple flag keys replace in order", func(t *testing.T) {
+		got, err := replaceAttachmentsIntoPostContent(`{"zh_cn":{"content":[]},"files":[{"key":"file_old"}]}`, []attachmentItem{{Key: "a"}, {Key: "b"}})
+		if err != nil {
+			t.Fatalf("replaceAttachmentsIntoPostContent() error = %v", err)
+		}
+		var parsed map[string]interface{}
+		_ = json.Unmarshal([]byte(got), &parsed)
+		files, _ := parsed["files"].([]interface{})
+		if len(files) != 2 || files[0].(map[string]interface{})["key"] != "a" || files[1].(map[string]interface{})["key"] != "b" {
+			t.Fatalf("replace files = %#v, want [a, b]", parsed["files"])
+		}
+	})
+}
+
+// TestAttachmentFlagsMutuallyExclusiveWithContentFiles verifies the A-plan
+// contract: --content that already declares a files array cannot be combined
+// with attachment flags (--attachment / --set-attachments / --clear-attachments).
+func TestAttachmentFlagsMutuallyExclusiveWithContentFiles(t *testing.T) {
+	contentWithFiles := `{"zh_cn":{"content":[]},"files":[{"key":"file_old"}]}`
+	contentNoFiles := `{"zh_cn":{"content":[]}}`
+
+	t.Run("send content-with-files + attachment rejected", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"chat-id": "oc_123", "msg-type": "post", "content": contentWithFiles,
+		}, map[string][]string{"attachment": {"file_new"}})
+		err := ImMessagesSend.Validate(context.Background(), rt)
+		if err == nil || !strings.Contains(err.Error(), "files array") {
+			t.Fatalf("ImMessagesSend.Validate() = %v, want files-array conflict", err)
+		}
+	})
+
+	t.Run("send content-no-files + attachment allowed", func(t *testing.T) {
+		rt := newSliceRuntimeContext(map[string]string{
+			"chat-id": "oc_123", "msg-type": "post", "content": contentNoFiles,
+		}, map[string][]string{"attachment": {"file_new"}})
+		if err := ImMessagesSend.Validate(context.Background(), rt); err != nil {
+			t.Fatalf("ImMessagesSend.Validate() unexpected error = %v", err)
+		}
+	})
+
+	t.Run("edit content-with-files + set-attachments rejected", func(t *testing.T) {
+		rt := newEditTestRuntimeContext(map[string]string{
+			"message-id": "om_1", "msg-type": "post", "content": contentWithFiles,
+		}, map[string][]string{"set-attachments": {"file_new"}})
+		err := ImMessagesEdit.Validate(context.Background(), rt)
+		if err == nil || !strings.Contains(err.Error(), "files array") {
+			t.Fatalf("ImMessagesEdit.Validate() = %v, want files-array conflict", err)
+		}
+	})
+
+	t.Run("edit content-with-files + clear-attachments rejected", func(t *testing.T) {
+		rt := newEditTestRuntimeContext(map[string]string{
+			"message-id": "om_1", "msg-type": "post", "content": contentWithFiles, "clear-attachments": "true",
+		}, nil)
+		err := ImMessagesEdit.Validate(context.Background(), rt)
+		if err == nil || !strings.Contains(err.Error(), "files array") {
+			t.Fatalf("ImMessagesEdit.Validate() = %v, want files-array conflict", err)
+		}
+	})
+
+	t.Run("edit content-no-files + set-attachments allowed", func(t *testing.T) {
+		rt := newEditTestRuntimeContext(map[string]string{
+			"message-id": "om_1", "msg-type": "post", "content": contentNoFiles,
+		}, map[string][]string{"set-attachments": {"file_new"}})
+		if err := ImMessagesEdit.Validate(context.Background(), rt); err != nil {
+			t.Fatalf("ImMessagesEdit.Validate() unexpected error = %v", err)
+		}
+	})
 }

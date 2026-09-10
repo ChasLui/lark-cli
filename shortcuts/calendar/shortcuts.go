@@ -10,7 +10,17 @@ func Shortcuts() []common.Shortcut {
 	return []common.Shortcut{
 		CalendarAgenda,
 		CalendarCreate,
+		CalendarDelete,
+		CalendarUpdate,
 		CalendarFreebusy,
+		CalendarRoomFind,
+		CalendarRsvp,
 		CalendarSuggestion,
+		CalendarMeeting,
+		CalendarSearchEvent,
+		CalendarGet,
+		CalendarTransfer,
+		CalendarJoinEvent,
+		CalendarListAttendees,
 	}
 }

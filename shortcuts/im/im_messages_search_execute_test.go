@@ -18,21 +18,27 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func TestImMessagesSearchSupportsUserAndBotIdentity(t *testing.T) {
+	if !stringSliceContains(ImMessagesSearch.AuthTypes, "user") {
+		t.Fatalf("ImMessagesSearch.AuthTypes = %v, want user support", ImMessagesSearch.AuthTypes)
+	}
+	if !stringSliceContains(ImMessagesSearch.AuthTypes, "bot") {
+		t.Fatalf("ImMessagesSearch.AuthTypes = %v, want bot support for tenant access token", ImMessagesSearch.AuthTypes)
+	}
+}
+
 func newMessagesSearchRuntime(t *testing.T, stringFlags map[string]string, boolFlags map[string]bool, rt http.RoundTripper) *common.RuntimeContext {
 	t.Helper()
 
 	runtime := newBotShortcutRuntime(t, rt)
 	cmd := &cobra.Command{Use: "test"}
 
-	stringFlagNames := []string{
-		"query",
-		"page-size",
-		"page-token",
-		"page-limit",
-	}
+	stringFlagNames := []string{"query", "page-token", "at-chatter-ids"}
 	for _, name := range stringFlagNames {
 		cmd.Flags().String(name, "", "")
 	}
+	cmd.Flags().Int("page-size", 20, "")
+	cmd.Flags().Int("page-limit", 20, "")
 	boolFlagNames := []string{"page-all"}
 	for _, name := range boolFlagNames {
 		cmd.Flags().Bool(name, false, "")
@@ -69,12 +75,6 @@ func TestImMessagesSearchExecuteAutoPaginationBatches(t *testing.T) {
 		"page-all": true,
 	}, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
-		case strings.Contains(req.URL.Path, "tenant_access_token"):
-			return shortcutJSONResponse(200, map[string]interface{}{
-				"code":                0,
-				"tenant_access_token": "tenant-token",
-				"expire":              7200,
-			}), nil
 		case strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/search"):
 			pageToken := req.URL.Query().Get("page_token")
 			searchPageTokens = append(searchPageTokens, pageToken)
@@ -167,12 +167,6 @@ func TestImMessagesSearchExecuteExplicitPageLimitWithoutPageAll(t *testing.T) {
 		"page-limit": "2",
 	}, nil, shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
-		case strings.Contains(req.URL.Path, "tenant_access_token"):
-			return shortcutJSONResponse(200, map[string]interface{}{
-				"code":                0,
-				"tenant_access_token": "tenant-token",
-				"expire":              7200,
-			}), nil
 		case strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/search"):
 			searchCalls++
 			pageToken := req.URL.Query().Get("page_token")
@@ -282,4 +276,13 @@ func buildChatContexts(chatIDs []string) []interface{} {
 		})
 	}
 	return items
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

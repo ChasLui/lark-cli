@@ -5,85 +5,87 @@ package doc
 
 import (
 	"context"
+	"strings"
+
+	"github.com/spf13/cobra"
 
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
+const docsContentPathAnnotation = "lark-cli.docs.content-input-path"
+
+// v1CreateFlags returns hidden parse-only compatibility flags for old v1 commands.
+func v1CreateFlags() []common.Flag {
+	return docsLegacyFlagDefinitions(docsCreateLegacyFlags())
+}
+
+var docsCreateLocalResourceScopes = []string{
+	"docs:document.media:upload",
+	"docx:document:write_only",
+	"docx:document:readonly",
+}
+
 var DocsCreate = common.Shortcut{
-	Service:     "docs",
-	Command:     "+create",
-	Description: "Create a Lark document",
-	Risk:        "write",
-	AuthTypes:   []string{"user", "bot"},
-	Scopes:      []string{"docx:document:create"},
-	Flags: []common.Flag{
-		{Name: "title", Desc: "document title"},
-		{Name: "markdown", Desc: "Markdown content (Lark-flavored)", Required: true},
-		{Name: "folder-token", Desc: "parent folder token"},
-		{Name: "wiki-node", Desc: "wiki node token"},
-		{Name: "wiki-space", Desc: "wiki space ID (use my_library for personal library)"},
-	},
+	Service:           "docs",
+	Command:           "+create",
+	Description:       "Create a Lark document",
+	Risk:              "write",
+	AuthTypes:         []string{"user", "bot"},
+	Scopes:            []string{"docx:document:create"},
+	ConditionalScopes: docsCreateLocalResourceScopes,
+	PostMount:         installDocsContentPathCapture,
+	Flags: concatFlags(
+		[]common.Flag{
+			docsAPIVersionCompatFlag(),
+			docsOutputFormatCompatFlag(),
+			docsJSONOutputCompatFlag(),
+		},
+		v2CreateFlags(),
+		v1CreateFlags(),
+	),
 	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
-		count := 0
-		if runtime.Str("folder-token") != "" {
-			count++
-		}
-		if runtime.Str("wiki-node") != "" {
-			count++
-		}
-		if runtime.Str("wiki-space") != "" {
-			count++
-		}
-		if count > 1 {
-			return common.FlagErrorf("--folder-token, --wiki-node, and --wiki-space are mutually exclusive")
-		}
-		return nil
+		return validateCreateV2(ctx, runtime)
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
-		args := map[string]interface{}{
-			"markdown": runtime.Str("markdown"),
-		}
-		if v := runtime.Str("title"); v != "" {
-			args["title"] = v
-		}
-		if v := runtime.Str("folder-token"); v != "" {
-			args["folder_token"] = v
-		}
-		if v := runtime.Str("wiki-node"); v != "" {
-			args["wiki_node"] = v
-		}
-		if v := runtime.Str("wiki-space"); v != "" {
-			args["wiki_space"] = v
-		}
-		return common.NewDryRunAPI().
-			POST(common.MCPEndpoint(runtime.Config.Brand)).
-			Desc("MCP tool: create-doc").
-			Body(map[string]interface{}{"method": "tools/call", "params": map[string]interface{}{"name": "create-doc", "arguments": args}}).
-			Set("mcp_tool", "create-doc").Set("args", args)
+		return dryRunCreateV2(ctx, runtime)
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
-		args := map[string]interface{}{
-			"markdown": runtime.Str("markdown"),
-		}
-		if v := runtime.Str("title"); v != "" {
-			args["title"] = v
-		}
-		if v := runtime.Str("folder-token"); v != "" {
-			args["folder_token"] = v
-		}
-		if v := runtime.Str("wiki-node"); v != "" {
-			args["wiki_node"] = v
-		}
-		if v := runtime.Str("wiki-space"); v != "" {
-			args["wiki_space"] = v
-		}
-
-		result, err := common.CallMCPTool(runtime, "create-doc", args)
-		if err != nil {
-			return err
-		}
-
-		runtime.Out(result, nil)
-		return nil
+		return executeCreateV2(ctx, runtime)
 	},
+}
+
+func installDocsContentPathCapture(cmd *cobra.Command) {
+	previousPreRunE := cmd.PreRunE
+	cmd.PreRunE = func(command *cobra.Command, args []string) error {
+		if previousPreRunE != nil {
+			if err := previousPreRunE(command, args); err != nil {
+				return err
+			}
+		}
+		captureDocsContentPath(command)
+		return nil
+	}
+}
+
+func captureDocsContentPath(cmd *cobra.Command) {
+	if cmd.Annotations == nil {
+		cmd.Annotations = make(map[string]string)
+	}
+	delete(cmd.Annotations, docsContentPathAnnotation)
+	raw, err := cmd.Flags().GetString("content")
+	if err != nil || !strings.HasPrefix(raw, "@") || strings.HasPrefix(raw, "@@") {
+		return
+	}
+	if path := strings.TrimSpace(strings.TrimPrefix(raw, "@")); path != "" {
+		cmd.Annotations[docsContentPathAnnotation] = path
+	}
+}
+
+// concatFlags combines multiple flag slices into one.
+func concatFlags(slices ...[]common.Flag) []common.Flag {
+	var out []common.Flag
+	for _, s := range slices {
+		out = append(out, s...)
+	}
+	return out
 }

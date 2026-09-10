@@ -4,497 +4,283 @@
 package schema
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"io"
-	"sort"
 	"strings"
 
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/internal/affordance"
+	"github.com/larksuite/cli/internal/apicatalog"
 	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/meta"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/registry"
-	"github.com/larksuite/cli/internal/util"
+	"github.com/larksuite/cli/internal/schema"
 	"github.com/spf13/cobra"
 )
+
+// CommandVisibility reports whether one canonical generated-command path is
+// referenceable in the current build. Paths use the same segments as
+// apicatalog.MethodRef.CommandPath (for example
+// ["mail", "user_mailbox.messages", "list"]). A nil visibility keeps the
+// complete schema catalog.
+//
+// The callback is deliberately command-facing rather than policy-facing:
+// cmd/schema only consumes the final build-local presentation surface and does
+// not know why a command is or is not referenceable.
+type CommandVisibility func(path []string) bool
 
 // SchemaOptions holds all inputs for the schema command.
 type SchemaOptions struct {
 	Factory *cmdutil.Factory
+	Ctx     context.Context
 
-	// Positional args
-	Path string
-
-	// Flags
-	Format string
+	// Args are the positional path segments, in either the dotted single-arg
+	// form ("im.messages.reply") or the space-separated form ("im messages
+	// reply"); apicatalog.ParsePath normalizes both.
+	Args []string
 }
 
-func printServices(w io.Writer) {
-	services := registry.ListFromMetaProjects()
-	fmt.Fprintf(w, "%sAvailable services:%s\n\n", output.Bold, output.Reset)
-	for _, s := range services {
-		spec := registry.LoadFromMeta(s)
-		title := registry.GetStrFromMap(spec, "title")
-		if title == "" {
-			title = registry.GetStrFromMap(spec, "description")
-		}
-		fmt.Fprintf(w, "  %s%s%s  %s%s%s\n", output.Cyan, s, output.Reset, output.Dim, title, output.Reset)
-	}
-	fmt.Fprintf(w, "\n%sUsage: lark-cli schema <service>.<resource>.<method>%s\n", output.Dim, output.Reset)
-}
-
-func printResourceList(w io.Writer, spec map[string]interface{}) {
-	name := registry.GetStrFromMap(spec, "name")
-	version := registry.GetStrFromMap(spec, "version")
-	title := registry.GetStrFromMap(spec, "title")
-	if title == "" {
-		title = registry.GetStrFromMap(spec, "description")
-	}
-	servicePath := registry.GetStrFromMap(spec, "servicePath")
-
-	fmt.Fprintf(w, "%s%s%s (%s) — %s\n\n", output.Bold, name, output.Reset, version, title)
-	fmt.Fprintf(w, "%sBase path: %s%s\n\n", output.Dim, servicePath, output.Reset)
-
-	resources, _ := spec["resources"].(map[string]interface{})
-	for _, resName := range sortedKeys(resources) {
-		fmt.Fprintf(w, "  %s%s%s\n", output.Cyan, resName, output.Reset)
-		resMap, _ := resources[resName].(map[string]interface{})
-		methods, _ := resMap["methods"].(map[string]interface{})
-		for _, methodName := range sortedKeys(methods) {
-			m, _ := methods[methodName].(map[string]interface{})
-			httpMethod := registry.GetStrFromMap(m, "httpMethod")
-			desc := registry.GetStrFromMap(m, "description")
-			danger := ""
-			if d, _ := m["danger"].(bool); d {
-				danger = fmt.Sprintf(" %s[danger]%s", output.Red, output.Reset)
-			}
-			fmt.Fprintf(w, "    %-7s %s%s%s  %s%s%s%s\n", httpMethod, output.Bold, methodName, output.Reset, output.Dim, desc, output.Reset, danger)
-		}
-		fmt.Fprintln(w)
-	}
-	fmt.Fprintf(w, "%sUsage: lark-cli schema %s.<resource>.<method>%s\n", output.Dim, name, output.Reset)
-}
-
-func printMethodDetail(w io.Writer, spec map[string]interface{}, resName, methodName string, method map[string]interface{}) {
-	servicePath := registry.GetStrFromMap(spec, "servicePath")
-	specName := registry.GetStrFromMap(spec, "name")
-	methodPath := registry.GetStrFromMap(method, "path")
-	fullPath := servicePath + "/" + methodPath
-	httpMethod := registry.GetStrFromMap(method, "httpMethod")
-	desc := registry.GetStrFromMap(method, "description")
-
-	fmt.Fprintf(w, "%s%s.%s.%s%s\n\n", output.Bold, specName, resName, methodName, output.Reset)
-
-	httpColor := output.Yellow
-	if httpMethod == "GET" {
-		httpColor = output.Green
-	} else if httpMethod == "DELETE" {
-		httpColor = output.Red
-	}
-	fmt.Fprintf(w, "  %s%s%s %s\n", httpColor, httpMethod, output.Reset, fullPath)
-	if desc != "" {
-		fmt.Fprintf(w, "  %s\n", desc)
-	}
-	fmt.Fprintln(w)
-
-	// Parameters
-	params, _ := method["parameters"].(map[string]interface{})
-	if len(params) > 0 {
-		fmt.Fprintf(w, "%sParameters:%s\n\n", output.Bold, output.Reset)
-		fmt.Fprintf(w, "  %s--params%s  <json>  %soptional%s\n", output.Cyan, output.Reset, output.Dim, output.Reset)
-		for _, paramName := range sortedParamKeys(params) {
-			p, _ := params[paramName].(map[string]interface{})
-			pType := registry.GetStrFromMap(p, "type")
-			if pType == "" {
-				pType = "string"
-			}
-			location := registry.GetStrFromMap(p, "location")
-			required, _ := p["required"].(bool)
-			reqStr := fmt.Sprintf("%soptional%s", output.Dim, output.Reset)
-			if required {
-				reqStr = fmt.Sprintf("%srequired%s", output.Red, output.Reset)
-			}
-			locColor := output.Dim
-			if location == "path" {
-				locColor = output.Yellow
-			}
-			// Options (enum values)
-			optStr := formatOptions(p)
-			fmt.Fprintf(w, "      - %s%s%s (%s, %s%s%s, %s)%s\n", output.Cyan, paramName, output.Reset, pType, locColor, location, output.Reset, reqStr, optStr)
-			if pdesc := registry.GetStrFromMap(p, "description"); pdesc != "" {
-				pdesc = util.TruncateStrWithEllipsis(pdesc, 100)
-				fmt.Fprintf(w, "        %s%s%s\n", output.Dim, pdesc, output.Reset)
-			}
-			if ex := registry.GetStrFromMap(p, "example"); ex != "" {
-				fmt.Fprintf(w, "        %se.g. %s%s\n", output.Dim, ex, output.Reset)
-			}
-			if rangeStr := formatRange(p); rangeStr != "" {
-				fmt.Fprintf(w, "        %srange: %s%s\n", output.Dim, rangeStr, output.Reset)
-			}
-		}
-		fmt.Fprintln(w)
-	}
-
-	// --data for write methods
-	if httpMethod == "POST" || httpMethod == "PUT" || httpMethod == "PATCH" || httpMethod == "DELETE" {
-		if len(params) == 0 {
-			fmt.Fprintf(w, "%sParameters:%s\n\n", output.Bold, output.Reset)
-		}
-		fmt.Fprintf(w, "  %s--data%s  <json>  %soptional%s\n", output.Cyan, output.Reset, output.Dim, output.Reset)
-		requestBody, _ := method["requestBody"].(map[string]interface{})
-		if len(requestBody) > 0 {
-			printNestedFields(w, requestBody, "      ", "")
-		}
-		fmt.Fprintln(w)
-	}
-
-	// Response
-	responseBody, _ := method["responseBody"].(map[string]interface{})
-	if len(responseBody) > 0 {
-		fmt.Fprintf(w, "%sResponse:%s\n\n", output.Bold, output.Reset)
-		printNestedFields(w, responseBody, "  ", "")
-		fmt.Fprintln(w)
-	}
-
-	// Identity
-	if tokens, ok := method["accessTokens"].([]interface{}); ok && len(tokens) > 0 {
-		var identities []string
-		for _, t := range tokens {
-			if s, ok := t.(string); ok {
-				switch s {
-				case "user":
-					identities = append(identities, "user")
-				case "tenant":
-					identities = append(identities, "bot")
-				}
-			}
-		}
-		if len(identities) > 0 {
-			fmt.Fprintf(w, "%sIdentity:%s %s\n", output.Bold, output.Reset, strings.Join(identities, ", "))
-		}
-	}
-
-	// Scopes (all)
-	if scopes, ok := method["scopes"].([]interface{}); ok && len(scopes) > 0 {
-		var scopeStrs []string
-		for _, s := range scopes {
-			if str, ok := s.(string); ok {
-				scopeStrs = append(scopeStrs, str)
-			}
-		}
-		fmt.Fprintf(w, "%sScopes:%s   %s\n", output.Bold, output.Reset, strings.Join(scopeStrs, ", "))
-	}
-
-	// CLI example
-	fmt.Fprintf(w, "%sCLI:%s      lark-cli %s %s %s\n", output.Bold, output.Reset, specName, resName, methodName)
-
-	// Docs
-	if docUrl := registry.GetStrFromMap(method, "docUrl"); docUrl != "" {
-		fmt.Fprintf(w, "%sDocs:%s     %s\n", output.Bold, output.Reset, docUrl)
-	}
-}
-
-func printNestedFields(w io.Writer, fields map[string]interface{}, indent, prefix string) {
-	for _, fieldName := range sortedFieldKeys(fields) {
-		f, _ := fields[fieldName].(map[string]interface{})
-		fullName := fieldName
-		if prefix != "" {
-			fullName = prefix + "." + fieldName
-		}
-		fType := registry.GetStrFromMap(f, "type")
-		required, _ := f["required"].(bool)
-		reqStr := fmt.Sprintf("%soptional%s", output.Dim, output.Reset)
-		if required {
-			reqStr = fmt.Sprintf("%srequired%s", output.Red, output.Reset)
-		}
-		optStr := formatOptions(f)
-		fmt.Fprintf(w, "%s- %s%s%s (%s, %s)%s\n", indent, output.Cyan, fullName, output.Reset, fType, reqStr, optStr)
-		desc := registry.GetStrFromMap(f, "description")
-		if desc != "" {
-			desc = util.TruncateStrWithEllipsis(desc, 100)
-			fmt.Fprintf(w, "%s  %s%s%s\n", indent, output.Dim, desc, output.Reset)
-		}
-		if ex := registry.GetStrFromMap(f, "example"); ex != "" {
-			fmt.Fprintf(w, "%s  %se.g. %s%s\n", indent, output.Dim, ex, output.Reset)
-		}
-		if rangeStr := formatRange(f); rangeStr != "" {
-			fmt.Fprintf(w, "%s  %srange: %s%s\n", indent, output.Dim, rangeStr, output.Reset)
-		}
-		if props, ok := f["properties"].(map[string]interface{}); ok && len(props) > 0 {
-			printNestedFields(w, props, indent+"  ", fullName)
-		}
-	}
-}
-
-// formatOptions returns " — val1 | val2 | ..." if field has options, else "".
-func formatOptions(f map[string]interface{}) string {
-	opts, ok := f["options"].([]interface{})
-	if !ok || len(opts) == 0 {
-		return ""
-	}
-	var vals []string
-	for _, o := range opts {
-		if om, ok := o.(map[string]interface{}); ok {
-			if v := registry.GetStrFromMap(om, "value"); v != "" {
-				vals = append(vals, v)
-			}
-		}
-	}
-	if len(vals) == 0 {
-		return ""
-	}
-	return fmt.Sprintf(" %s— %s%s", output.Dim, strings.Join(vals, " | "), output.Reset)
-}
-
-// formatRange returns "min..max" if field has min/max, else "".
-func formatRange(f map[string]interface{}) string {
-	minVal := registry.GetStrFromMap(f, "min")
-	maxVal := registry.GetStrFromMap(f, "max")
-	if minVal == "" && maxVal == "" {
-		return ""
-	}
-	if minVal != "" && maxVal != "" {
-		return minVal + ".." + maxVal
-	}
-	if minVal != "" {
-		return ">=" + minVal
-	}
-	return "<=" + maxVal
-}
-
-// sortedKeys returns map keys in alphabetical order.
-func sortedKeys(m map[string]interface{}) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-// sortedParamKeys returns parameter keys sorted: required first, then alphabetical.
-func sortedParamKeys(params map[string]interface{}) []string {
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		pi, _ := params[keys[i]].(map[string]interface{})
-		pj, _ := params[keys[j]].(map[string]interface{})
-		ri, _ := pi["required"].(bool)
-		rj, _ := pj["required"].(bool)
-		if ri != rj {
-			return ri
-		}
-		return keys[i] < keys[j]
-	})
-	return keys
-}
-
-// sortedFieldKeys returns field keys sorted: required first, then alphabetical.
-func sortedFieldKeys(fields map[string]interface{}) []string {
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		fi, _ := fields[keys[i]].(map[string]interface{})
-		fj, _ := fields[keys[j]].(map[string]interface{})
-		ri, _ := fi["required"].(bool)
-		rj, _ := fj["required"].(bool)
-		if ri != rj {
-			return ri
-		}
-		return keys[i] < keys[j]
-	})
-	return keys
-}
-
-func findResourceByPath(resources map[string]interface{}, parts []string) (map[string]interface{}, string, []string) {
-	for i := len(parts); i >= 1; i-- {
-		candidateName := strings.Join(parts[:i], ".")
-		if res, ok := resources[candidateName]; ok {
-			if resMap, ok := res.(map[string]interface{}); ok {
-				return resMap, candidateName, parts[i:]
-			}
-		}
-	}
-	return nil, "", nil
-}
-
-// NewCmdSchema creates the schema command. If runF is non-nil it is called instead of schemaRun (test hook).
+// NewCmdSchema creates the schema command. If runF is non-nil it is called instead of the default runner (test hook).
 func NewCmdSchema(f *cmdutil.Factory, runF func(*SchemaOptions) error) *cobra.Command {
+	return NewCmdSchemaWithVisibility(f, nil, runF)
+}
+
+// NewCmdSchemaWithVisibility creates the schema command projected through one
+// build-local command surface. Existing callers should use NewCmdSchema; the
+// root builder uses this form so schema execution and completion share the
+// exact presentation plan captured by that Cobra tree.
+func NewCmdSchemaWithVisibility(
+	f *cmdutil.Factory,
+	visibility CommandVisibility,
+	runF func(*SchemaOptions) error,
+) *cobra.Command {
 	opts := &SchemaOptions{Factory: f}
 
 	cmd := &cobra.Command{
-		Use:   "schema [path]",
+		Use:   "schema [path | service resource method]",
 		Short: "View API method parameters, types, and scopes",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  cobra.MaximumNArgs(8),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) > 0 {
-				opts.Path = args[0]
-			}
+			opts.Args = append([]string(nil), args...)
+			opts.Ctx = cmd.Context()
 			if runF != nil {
 				return runF(opts)
 			}
-			return schemaRun(opts)
+			return schemaRunWithVisibility(opts, visibility)
 		},
 	}
 	cmdutil.DisableAuthCheck(cmd)
 
-	cmd.ValidArgsFunction = completeSchemaPath
-	cmd.Flags().StringVar(&opts.Format, "format", "json", "output format: json (default) | pretty")
-	_ = cmd.RegisterFlagCompletionFunc("format", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-		return []string{"json", "pretty"}, cobra.ShellCompDirectiveNoFileComp
-	})
+	// Tolerated for agent compatibility; ignored — schema only emits the JSON
+	// envelope, and its output is identity-independent (strict-mode filtering
+	// comes from ResolveStrictMode, never from --as).
+	cmd.Flags().String("format", "json", "")
+	cmd.Flags().Bool("json", true, "")
+	cmd.Flags().String("as", "", "")
+	_ = cmd.Flags().MarkHidden("format")
+	_ = cmd.Flags().MarkHidden("json")
+	_ = cmd.Flags().MarkHidden("as")
+
+	cmd.ValidArgsFunction = completeSchemaPath(f, visibility)
+	cmdutil.SetRisk(cmd, cmdutil.RiskRead)
 
 	return cmd
 }
 
-// completeSchemaPath provides tab-completion for the schema path argument.
-// It handles dotted resource names (e.g. app.table.fields) by iterating all
-// resources and classifying each as a prefix-match or fully-matched.
-func completeSchemaPath(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	if len(args) > 0 {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-
-	parts := strings.Split(toComplete, ".")
-
-	// Level 1: complete service names
-	if len(parts) <= 1 {
-		var completions []string
-		for _, s := range registry.ListFromMetaProjects() {
-			if strings.HasPrefix(s, toComplete) {
-				completions = append(completions, s+".")
-			}
+// completeSchemaPath is a thin adapter over the schema catalog's Complete.
+// It uses the same source as schema execution so completion candidates match
+// what `schema` can resolve.
+func completeSchemaPath(
+	f *cmdutil.Factory,
+	visibility CommandVisibility,
+) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		mode := f.ResolveStrictMode(cmd.Context())
+		catalog := projectSchemaCatalog(f.APICatalog, visibility)
+		completions, noSpace := catalog.Complete(args, toComplete, registry.FilterForStrictMode(mode))
+		directive := cobra.ShellCompDirectiveNoFileComp
+		if noSpace {
+			directive |= cobra.ShellCompDirectiveNoSpace
 		}
-		return completions, cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoSpace
+		return completions, directive
 	}
-
-	serviceName := parts[0]
-	spec := registry.LoadFromMeta(serviceName)
-	if spec == nil {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-	resources, _ := spec["resources"].(map[string]interface{})
-	if resources == nil {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-
-	// afterService = everything user typed after "serviceName."
-	afterService := strings.Join(parts[1:], ".")
-
-	var completions []string
-
-	for resName, resVal := range resources {
-		if strings.HasPrefix(resName, afterService) {
-			// afterService is a prefix of this resource name → resource candidate
-			completions = append(completions, serviceName+"."+resName+".")
-		} else if strings.HasPrefix(afterService, resName+".") {
-			// This resource is fully matched; remainder is method prefix
-			methodPrefix := afterService[len(resName)+1:]
-			resMap, _ := resVal.(map[string]interface{})
-			if resMap == nil {
-				continue
-			}
-			methods, _ := resMap["methods"].(map[string]interface{})
-			for methodName := range methods {
-				if strings.HasPrefix(methodName, methodPrefix) {
-					completions = append(completions, serviceName+"."+resName+"."+methodName)
-				}
-			}
-		}
-	}
-
-	sort.Strings(completions)
-
-	// If all completions end with ".", user is still navigating resources → NoSpace
-	allTrailingDot := len(completions) > 0
-	for _, c := range completions {
-		if !strings.HasSuffix(c, ".") {
-			allTrailingDot = false
-			break
-		}
-	}
-	directive := cobra.ShellCompDirectiveNoFileComp
-	if allTrailingDot {
-		directive |= cobra.ShellCompDirectiveNoSpace
-	}
-	return completions, directive
 }
 
-func schemaRun(opts *SchemaOptions) error {
+func schemaRunWithVisibility(opts *SchemaOptions, visibility CommandVisibility) error {
 	out := opts.Factory.IOStreams.Out
+	mode := opts.Factory.ResolveStrictMode(opts.Ctx)
+	return runSchemaCatalog(out, apicatalog.ParsePath(opts.Args), mode, opts.Factory.APICatalog, opts.Factory.Affordance, visibility)
+}
 
-	if opts.Path == "" {
-		printServices(out)
+// runSchemaCatalog resolves the path through the build-selected schema catalog
+// and renders the matching envelope(s). The catalog owns navigation (Resolve +
+// MethodRefs), while this adapter applies presentation visibility and chooses
+// the output shape.
+func runSchemaCatalog(
+	out io.Writer,
+	parts []string,
+	mode core.StrictMode,
+	catalog apicatalog.Catalog,
+	guidance *affordance.Resolver,
+	visibility CommandVisibility,
+) error {
+	// Test the source catalog before presentation projection. A distribution
+	// that intentionally conceals every generated method still has metadata;
+	// bare `schema` should render an empty list rather than claim metadata is
+	// unavailable.
+	if len(catalog.Names()) == 0 {
+		return errs.NewValidationError(errs.SubtypeFailedPrecondition, "No API metadata available").
+			WithHint("the current command build did not select any API metadata")
+	}
+	catalog = projectSchemaCatalog(catalog, visibility)
+	target, err := catalog.Resolve(parts)
+	if err != nil {
+		if loadErr := catalog.Err(); loadErr != nil {
+			return loadErr
+		}
+		return resolveError(err)
+	}
+	refs := catalog.MethodRefs(target, registry.FilterForStrictMode(mode))
+	// Navigation parses shards lazily; a corrupt shard must fail typed rather
+	// than silently shrink the listing.
+	if loadErr := catalog.Err(); loadErr != nil {
+		return loadErr
+	}
+	if target.Kind == apicatalog.TargetMethod {
+		if len(refs) == 0 {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument,
+				"Method %s not available in current identity mode", target.Method.SchemaPath()).
+				WithHint("strict mode hides methods the active account identity cannot call; it is shown for an identity (user or bot) that has the required access token")
+		}
+		output.PrintJson(out, schema.EnvelopeOf(guidance, refs[0]))
 		return nil
 	}
-
-	parts := strings.Split(opts.Path, ".")
-
-	serviceName := parts[0]
-	spec := registry.LoadFromMeta(serviceName)
-	if spec == nil {
-		return output.ErrWithHint(output.ExitValidation, "validation",
-			fmt.Sprintf("Unknown service: %s", serviceName),
-			fmt.Sprintf("Available: %s", strings.Join(registry.ListFromMetaProjects(), ", ")))
-	}
-
-	if len(parts) == 1 {
-		if opts.Format == "pretty" {
-			printResourceList(out, spec)
-		} else {
-			output.PrintJson(out, spec)
-		}
-		return nil
-	}
-
-	resources, _ := spec["resources"].(map[string]interface{})
-	resource, resName, remaining := findResourceByPath(resources, parts[1:])
-	if resource == nil {
-		var resNames []string
-		for k := range resources {
-			resNames = append(resNames, k)
-		}
-		return output.ErrWithHint(output.ExitValidation, "validation",
-			fmt.Sprintf("Unknown resource: %s.%s", serviceName, strings.Join(parts[1:], ".")),
-			fmt.Sprintf("Available: %s", strings.Join(resNames, ", ")))
-	}
-
-	if len(remaining) == 0 {
-		if opts.Format == "pretty" {
-			fmt.Fprintf(out, "%s%s.%s%s\n\n", output.Bold, serviceName, resName, output.Reset)
-			methods, _ := resource["methods"].(map[string]interface{})
-			for _, mName := range sortedKeys(methods) {
-				m, _ := methods[mName].(map[string]interface{})
-				httpMethod := registry.GetStrFromMap(m, "httpMethod")
-				desc := registry.GetStrFromMap(m, "description")
-				fmt.Fprintf(out, "  %-7s %s%s%s  %s%s%s\n", httpMethod, output.Bold, mName, output.Reset, output.Dim, desc, output.Reset)
-			}
-			fmt.Fprintf(out, "\n%sUsage: lark-cli schema %s.%s.<method>%s\n", output.Dim, serviceName, resName, output.Reset)
-		} else {
-			output.PrintJson(out, resource)
-		}
-		return nil
-	}
-
-	methodName := remaining[0]
-	methods, _ := resource["methods"].(map[string]interface{})
-	method, ok := methods[methodName].(map[string]interface{})
-	if !ok {
-		var mNames []string
-		for k := range methods {
-			mNames = append(mNames, k)
-		}
-		return output.ErrWithHint(output.ExitValidation, "validation",
-			fmt.Sprintf("Unknown method: %s.%s.%s", serviceName, resName, methodName),
-			fmt.Sprintf("Available: %s", strings.Join(mNames, ", ")))
-	}
-
-	if opts.Format == "pretty" {
-		printMethodDetail(out, spec, resName, methodName, method)
-	} else {
-		output.PrintJson(out, method)
-	}
+	output.PrintJson(out, schema.Envelopes(guidance, refs))
 	return nil
+}
+
+// projectSchemaCatalog produces the metadata view corresponding to one final
+// command surface. It lives in cmd/schema so apicatalog remains a policy-free
+// navigation module. Resolve, broad listings, and Complete all consume the
+// same projected Catalog, which also prevents resolve-error candidate hints
+// from naming concealed resources or methods.
+//
+// Unchanged branches retain their original maps. A parent is removed when
+// projection removed its last reachable method, so a fully concealed service
+// cannot survive as an empty schema namespace. Originally-empty, unaffected
+// metadata remains unchanged for backward compatibility.
+//
+// The projection is applied per service on first navigation, so a precise
+// `schema drive.file.list` still parses only the drive shard.
+func projectSchemaCatalog(catalog apicatalog.Catalog, visibility CommandVisibility) apicatalog.Catalog {
+	if visibility == nil {
+		return catalog
+	}
+	return apicatalog.Filter(catalog, func(service meta.Service) (meta.Service, bool) {
+		servicePath := []string{service.Name}
+		if !visibility(servicePath) {
+			return meta.Service{}, false
+		}
+		resources, resourceChanged, hasVisibleMethod := projectSchemaResources(
+			service.Resources,
+			servicePath,
+			visibility,
+		)
+		if resourceChanged && !hasVisibleMethod {
+			return meta.Service{}, false
+		}
+		if resourceChanged {
+			service.Resources = resources
+		}
+		return service, true
+	})
+}
+
+func projectSchemaResources(
+	resources map[string]meta.Resource,
+	parentPath []string,
+	visibility CommandVisibility,
+) (projected map[string]meta.Resource, changed, hasVisibleMethod bool) {
+	projected = make(map[string]meta.Resource, len(resources))
+	for name, resource := range resources {
+		resourcePath := appendPath(parentPath, name)
+		if !visibility(resourcePath) {
+			changed = true
+			continue
+		}
+
+		methods := make(map[string]meta.Method, len(resource.Methods))
+		resourceChanged := false
+		resourceHasVisibleMethod := false
+		for methodName, method := range resource.Methods {
+			if !visibility(appendPath(resourcePath, methodName)) {
+				resourceChanged = true
+				continue
+			}
+			methods[methodName] = method
+			resourceHasVisibleMethod = true
+		}
+
+		subResources, subChanged, subHasVisibleMethod := projectSchemaResources(
+			resource.Resources,
+			resourcePath,
+			visibility,
+		)
+		resourceChanged = resourceChanged || subChanged
+		resourceHasVisibleMethod = resourceHasVisibleMethod || subHasVisibleMethod
+
+		if resourceChanged && !resourceHasVisibleMethod {
+			// Projection removed the final method below this resource. Keeping
+			// the empty group would still reveal a concealed schema namespace.
+			changed = true
+			continue
+		}
+		if resourceChanged {
+			resource.Methods = methods
+			resource.Resources = subResources
+			changed = true
+		}
+		projected[name] = resource
+		hasVisibleMethod = hasVisibleMethod || resourceHasVisibleMethod
+	}
+
+	if !changed {
+		return resources, false, hasVisibleMethod
+	}
+	return projected, true, hasVisibleMethod
+}
+
+func appendPath(parent []string, segment string) []string {
+	path := make([]string, len(parent)+1)
+	copy(path, parent)
+	path[len(parent)] = segment
+	return path
+}
+
+// resolveError maps a catalog *ResolveError to a typed *errs.ValidationError
+// (CategoryValidation drives the exit code; Hint promotes to the envelope),
+// preserving the historical message + hint text.
+func resolveError(err error) error {
+	var re *apicatalog.ResolveError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch re.Kind {
+	case apicatalog.ErrService:
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "Unknown service: %s", re.Subject).
+			WithHint("Available: %s", strings.Join(re.Candidates, ", "))
+	case apicatalog.ErrResource:
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "Unknown resource: %s", re.Subject).
+			WithHint("Available: %s", strings.Join(re.Candidates, ", "))
+	case apicatalog.ErrMethod:
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "Unknown method: %s", re.Subject).
+			WithHint("Available: %s", strings.Join(re.Candidates, ", "))
+	case apicatalog.ErrPath:
+		return errs.NewValidationError(errs.SubtypeInvalidArgument, "Unknown path: %s", re.Subject).
+			WithHint("Method %q exists but the trailing segments %q do not resolve", re.Method, re.Trailing)
+	}
+	return err
 }

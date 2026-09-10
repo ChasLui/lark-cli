@@ -5,18 +5,16 @@ package im
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"net/http"
-	"os"
+	"mime"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/larksuite/cli/internal/output"
-	"github.com/larksuite/cli/internal/validate"
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/extension/download"
+	"github.com/larksuite/cli/extension/fileio"
+	"github.com/larksuite/cli/internal/downloadtransport"
 	"github.com/larksuite/cli/shortcuts/common"
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 )
 
 var ImMessagesResourcesDownload = common.Shortcut{
@@ -30,7 +28,7 @@ var ImMessagesResourcesDownload = common.Shortcut{
 		{Name: "message-id", Desc: "message ID (om_xxx)", Required: true},
 		{Name: "file-key", Desc: "resource key (img_xxx or file_xxx)", Required: true},
 		{Name: "type", Desc: "resource type (image or file)", Required: true, Enum: []string{"image", "file"}},
-		{Name: "output", Desc: "local save path (relative only, no .. traversal; defaults to file_key)"},
+		{Name: "output", Desc: "local save path, relative or absolute, within the allowed roots (cwd, /tmp, ~/files); when omitted, uses the server's Content-Disposition filename if available, otherwise file_key; extension is inferred from Content-Disposition or Content-Type if not provided"},
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		fileKey := runtime.Str("file-key")
@@ -46,16 +44,16 @@ var ImMessagesResourcesDownload = common.Shortcut{
 	},
 	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		if messageId := runtime.Str("message-id"); messageId == "" {
-			return output.ErrValidation("--message-id is required (om_xxx)")
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--message-id is required (om_xxx)").WithParam("--message-id")
 		} else if _, err := validateMessageID(messageId); err != nil {
 			return err
 		}
 		relPath, err := normalizeDownloadOutputPath(runtime.Str("file-key"), runtime.Str("output"))
 		if err != nil {
-			return output.ErrValidation("%s", err)
+			return err
 		}
-		if _, err := validate.SafeOutputPath(relPath); err != nil {
-			return output.ErrValidation("unsafe output path: %s", err)
+		if _, err := runtime.ResolveSavePath(relPath); err != nil {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "unsafe output path: %s", err).WithParam("--output").WithCause(err)
 		}
 		return nil
 	},
@@ -65,14 +63,16 @@ var ImMessagesResourcesDownload = common.Shortcut{
 		fileType := runtime.Str("type")
 		relPath, err := normalizeDownloadOutputPath(fileKey, runtime.Str("output"))
 		if err != nil {
-			return output.ErrValidation("invalid output path: %s", err)
+			return err
 		}
-		safePath, err := validate.SafeOutputPath(relPath)
-		if err != nil {
-			return output.ErrValidation("unsafe output path: %s", err)
+		if _, err := runtime.ResolveSavePath(relPath); err != nil {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "unsafe output path: %s", err).WithParam("--output").WithCause(err)
 		}
 
-		finalPath, sizeBytes, err := downloadIMResourceToPath(ctx, runtime, messageId, fileKey, fileType, safePath)
+		// With an explicit --output, keep that basename (append only an
+		// extension); without it, adopt the server's original filename.
+		preserveBasename := runtime.Str("output") != ""
+		finalPath, sizeBytes, err := downloadIMResourceToPath(ctx, runtime, messageId, fileKey, fileType, relPath, preserveBasename)
 		if err != nil {
 			return err
 		}
@@ -82,106 +82,169 @@ var ImMessagesResourcesDownload = common.Shortcut{
 	},
 }
 
+// normalizeDownloadOutputPath settles what --output names and leaves where it
+// may point to the built-in path policy: both call sites hand the result
+// straight to ResolveSavePath, which applies the allowlist, the denylist and
+// symlink resolution. The shape checks that used to sit here — absolute paths
+// refused outright, a leading ".." refused as escaping the working directory —
+// described the cwd-only rule the policy replaced, and refusing a full path
+// before the policy could judge it is what made an agent's first call fail.
+//
+// The file-key checks stay. A key carrying a path separator is a malformed key
+// rather than a path decision, and it is also what keeps the batch caller
+// (resolveResourceDownloadPath, which embeds the key in the path) from building
+// anything but a name directly under its own directory.
 func normalizeDownloadOutputPath(fileKey, outputPath string) (string, error) {
 	fileKey = strings.TrimSpace(fileKey)
 	if fileKey == "" {
-		return "", fmt.Errorf("file-key cannot be empty")
+		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "file-key cannot be empty").WithParam("--file-key")
 	}
 	if strings.ContainsAny(fileKey, "/\\") {
-		return "", fmt.Errorf("file-key cannot contain path separators")
+		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "file-key cannot contain path separators").WithParam("--file-key")
 	}
 	if outputPath == "" {
 		return fileKey, nil
 	}
 	outputPath = filepath.Clean(strings.TrimSpace(outputPath))
 	if outputPath == "." {
-		return "", fmt.Errorf("path cannot be empty")
-	}
-	if filepath.IsAbs(outputPath) {
-		return "", fmt.Errorf("absolute paths are not allowed")
-	}
-	if outputPath == ".." || strings.HasPrefix(outputPath, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path cannot escape the current working directory")
+		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "path cannot be empty").WithParam("--output")
 	}
 	return outputPath, nil
 }
 
-const defaultIMResourceDownloadTimeout = 120 * time.Second
+const (
+	imDownloadPartSize   = 32 * 1024 * 1024
+	imPartRetries        = download.DefaultPartRetries
+	imDownloadRetryDelay = 300 * time.Millisecond
+)
 
 var imMimeToExt = map[string]string{
-	"image/png":                   ".png",
-	"image/jpeg":                  ".jpg",
-	"image/gif":                   ".gif",
-	"image/webp":                  ".webp",
-	"image/svg+xml":               ".svg",
-	"application/pdf":             ".pdf",
-	"video/mp4":                   ".mp4",
-	"video/3gpp":                  ".3gp",
-	"video/x-msvideo":             ".avi",
-	"audio/mpeg":                  ".mp3",
-	"audio/ogg":                   ".ogg",
-	"audio/wav":                   ".wav",
-	"text/plain":                  ".txt",
-	"text/html":                   ".html",
-	"text/css":                    ".css",
-	"text/csv":                    ".csv",
-	"application/zip":             ".zip",
+	"image/png":                    ".png",
+	"image/jpeg":                   ".jpg",
+	"image/gif":                    ".gif",
+	"image/webp":                   ".webp",
+	"image/svg+xml":                ".svg",
+	"application/pdf":              ".pdf",
+	"video/mp4":                    ".mp4",
+	"video/3gpp":                   ".3gp",
+	"video/x-msvideo":              ".avi",
+	"audio/mpeg":                   ".mp3",
+	"audio/ogg":                    ".ogg",
+	"audio/wav":                    ".wav",
+	"text/plain":                   ".txt",
+	"text/html":                    ".html",
+	"text/css":                     ".css",
+	"text/csv":                     ".csv",
+	"application/zip":              ".zip",
 	"application/x-zip-compressed": ".zip",
 	"application/x-rar-compressed": ".rar",
-	"application/json":            ".json",
-	"application/xml":             ".xml",
-	"application/octet-stream":    ".bin",
-	"application/msword":          ".doc",
+	"application/json":             ".json",
+	"application/xml":              ".xml",
+	"application/octet-stream":     ".bin",
+	"application/msword":           ".doc",
 	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-	"application/vnd.ms-excel":    ".xls",
-	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-	"application/vnd.ms-powerpoint": ".ppt",
+	"application/vnd.ms-excel": ".xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         ".xlsx",
+	"application/vnd.ms-powerpoint":                                             ".ppt",
 	"application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
 }
 
-func downloadIMResourceToPath(ctx context.Context, runtime *common.RuntimeContext, messageID, fileKey, fileType, safePath string) (string, int64, error) {
-	query := larkcore.QueryParams{}
-	query.Set("type", fileType)
-	downloadResp, err := runtime.DoAPIStream(ctx, &larkcore.ApiReq{
-		HttpMethod: http.MethodGet,
-		ApiPath:    "/open-apis/im/v1/messages/:message_id/resources/:file_key",
-		PathParams: larkcore.PathParams{
-			"message_id": messageID,
-			"file_key":   fileKey,
-		},
-		QueryParams: query,
-	}, defaultIMResourceDownloadTimeout)
+func downloadIMResourceToPath(ctx context.Context, runtime *common.RuntimeContext, messageID, fileKey, fileType, outputPath string, preserveBasename bool) (string, int64, error) {
+	stream, err := openIMResourceDownload(ctx, runtime, messageID, fileKey, fileType)
 	if err != nil {
 		return "", 0, err
 	}
-	defer downloadResp.Body.Close()
+	defer stream.Body.Close()
 
-	if downloadResp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(downloadResp.Body, 4096))
-		if len(body) > 0 {
-			return "", 0, output.ErrNetwork("download failed: HTTP %d: %s", downloadResp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		return "", 0, output.ErrNetwork("download failed: HTTP %d", downloadResp.StatusCode)
-	}
+	finalPath := resolveIMResourceDownloadPath(outputPath, stream.Header.Get("Content-Type"), stream.Header.Get("Content-Disposition"), preserveBasename)
+	sizeBytes := stream.ContentLength
 
-	if err := os.MkdirAll(filepath.Dir(safePath), 0700); err != nil {
-		return "", 0, output.Errorf(output.ExitInternal, "api_error", "cannot create parent directory: %s", err)
-	}
-
-	// Auto-detect extension from Content-Type if missing
-	finalPath := safePath
-	if filepath.Ext(safePath) == "" {
-		contentType := downloadResp.Header.Get("Content-Type")
-		mimeType := strings.Split(contentType, ";")[0]
-		mimeType = strings.TrimSpace(mimeType)
-		if ext, ok := imMimeToExt[mimeType]; ok {
-			finalPath = safePath + ext
-		}
-	}
-
-	sizeBytes, err := validate.AtomicWriteFromReader(finalPath, downloadResp.Body, 0600)
+	result, err := runtime.FileIO().Save(finalPath, fileio.SaveOptions{
+		ContentType:   stream.Header.Get("Content-Type"),
+		ContentLength: sizeBytes,
+	}, stream.Body)
 	if err != nil {
-		return "", 0, output.Errorf(output.ExitInternal, "api_error", "cannot create file: %s", err)
+		return "", 0, common.WrapSaveErrorTyped(err)
 	}
-	return finalPath, sizeBytes, nil
+	if sizeBytes >= 0 && result.Size() != sizeBytes {
+		return "", 0, errs.NewNetworkError(errs.SubtypeNetworkTransport, "file size mismatch: expected %d, got %d", sizeBytes, result.Size())
+	}
+	savedPath, resolveErr := runtime.ResolveSavePath(finalPath)
+	if resolveErr != nil || savedPath == "" {
+		savedPath = finalPath
+	}
+	return savedPath, result.Size(), nil
+}
+
+func openIMResourceDownload(ctx context.Context, runtime *common.RuntimeContext, messageID, fileKey, fileType string) (*download.Stream, error) {
+	source := imResourceDownloadSource(runtime, messageID, fileKey, fileType)
+	return download.Open(ctx, source, download.Options{
+		PartSize:         imDownloadPartSize,
+		MaxPartRetries:   imPartRetries,
+		RetryDelay:       imDownloadRetryDelay,
+		DisableMultipart: fileType != "file",
+	})
+}
+
+// preserveBasename keeps explicit and batch output names collision-safe.
+func resolveIMResourceDownloadPath(safePath, contentType, contentDisposition string, preserveBasename bool) string {
+	if filepath.Ext(safePath) != "" {
+		return safePath
+	}
+	if cdFilename := parseContentDispositionFilename(contentDisposition); cdFilename != "" {
+		if !preserveBasename {
+			dir := filepath.Dir(safePath)
+			if dir == "." {
+				return cdFilename
+			}
+			return filepath.Join(dir, cdFilename)
+		}
+		if ext := filepath.Ext(cdFilename); ext != "" {
+			return safePath + ext
+		}
+	}
+	mimeType := strings.TrimSpace(strings.Split(contentType, ";")[0])
+	if ext, ok := imMimeToExt[mimeType]; ok {
+		return safePath + ext
+	}
+	return safePath
+}
+
+// parseContentDispositionFilename returns a safe server filename.
+func parseContentDispositionFilename(header string) string {
+	if header == "" {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(header)
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(params["filename"])
+	if name == "" {
+		return ""
+	}
+	if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return name
+}
+
+func imResourceDownloadSource(runtime *common.RuntimeContext, messageID, fileKey, fileType string) download.Source {
+	oapi := downloadtransport.NewOAPI(runtime.DoAPIStream)
+	transport := oapi.Get(
+		"/open-apis/im/v1/messages/:message_id/resources/:file_key",
+		downloadtransport.PathParam("message_id", messageID),
+		downloadtransport.PathParam("file_key", fileKey),
+		downloadtransport.Query("type", fileType),
+	)
+	// A message resource key pins the attachment bytes.
+	return download.ImmutableSource(transport)
 }

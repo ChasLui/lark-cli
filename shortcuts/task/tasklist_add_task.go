@@ -5,16 +5,13 @@ package task
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-
-	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
@@ -30,6 +27,7 @@ var AddTaskToTasklist = common.Shortcut{
 	Flags: []common.Flag{
 		{Name: "tasklist-id", Desc: "tasklist id", Required: true},
 		{Name: "task-id", Desc: "task id (comma-separated for multiple)", Required: true},
+		{Name: "section-guid", Desc: "section guid"},
 	},
 
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
@@ -38,6 +36,10 @@ var AddTaskToTasklist = common.Shortcut{
 
 		body := map[string]interface{}{
 			"tasklist_guid": extractTasklistGuid(runtime.Str("tasklist-id")),
+		}
+
+		if sectionGuid := strings.TrimSpace(runtime.Str("section-guid")); sectionGuid != "" {
+			body["section_guid"] = sectionGuid
 		}
 
 		return common.NewDryRunAPI().
@@ -50,11 +52,14 @@ var AddTaskToTasklist = common.Shortcut{
 		tasklistGuid := extractTasklistGuid(runtime.Str("tasklist-id"))
 		taskIds := strings.Split(runtime.Str("task-id"), ",")
 
-		queryParams := make(larkcore.QueryParams)
-		queryParams.Set("user_id_type", "open_id")
+		params := map[string]interface{}{"user_id_type": "open_id"}
 
 		body := map[string]interface{}{
 			"tasklist_guid": tasklistGuid,
+		}
+
+		if sectionGuid := strings.TrimSpace(runtime.Str("section-guid")); sectionGuid != "" {
+			body["section_guid"] = sectionGuid
 		}
 
 		var successful []map[string]interface{}
@@ -66,33 +71,20 @@ var AddTaskToTasklist = common.Shortcut{
 				continue
 			}
 
-			apiResp, err := runtime.DoAPI(&larkcore.ApiReq{
-				HttpMethod:  http.MethodPost,
-				ApiPath:     "/open-apis/task/v2/tasks/" + url.PathEscape(taskId) + "/add_tasklist",
-				QueryParams: queryParams,
-				Body:        body,
-			})
-
-			var result map[string]interface{}
-			if err == nil {
-				if parseErr := json.Unmarshal(apiResp.RawBody, &result); parseErr != nil {
-					err = WrapTaskError(ErrCodeTaskInternalError, fmt.Sprintf("failed to parse response: %v", parseErr), "parse add task response")
-				}
-			}
-
-			data, err := HandleTaskApiResult(result, err, "add task to tasklist")
+			data, err := callTaskAPITyped(runtime, http.MethodPost, "/open-apis/task/v2/tasks/"+url.PathEscape(taskId)+"/add_tasklist", params, body)
 			if err != nil {
+				presented := runtime.PresentError(err)
 				failDetail := map[string]interface{}{
 					"guid": taskId,
 				}
-				if exitErr, ok := err.(*output.ExitError); ok && exitErr.Detail != nil {
-					failDetail["type"] = exitErr.Detail.Type
-					failDetail["code"] = exitErr.Detail.Code
-					failDetail["message"] = exitErr.Detail.Message
-					failDetail["hint"] = exitErr.Detail.Hint
+				if p, ok := errs.ProblemOf(presented); ok {
+					failDetail["type"] = string(p.Subtype)
+					failDetail["code"] = p.Code
+					failDetail["message"] = p.Message
+					failDetail["hint"] = p.Hint
 				} else {
 					failDetail["type"] = "api_error"
-					failDetail["message"] = err.Error()
+					failDetail["message"] = presented.Error()
 				}
 				failed = append(failed, failDetail)
 			} else {
@@ -100,10 +92,12 @@ var AddTaskToTasklist = common.Shortcut{
 				guid, _ := task["guid"].(string)
 				taskUrl, _ := task["url"].(string)
 				taskUrl = truncateTaskURL(taskUrl)
-				successful = append(successful, map[string]interface{}{
+				item := map[string]interface{}{
 					"guid": guid,
 					"url":  taskUrl,
-				})
+				}
+				projectTaskFields(item, task, standardTaskOutputFields...)
+				successful = append(successful, item)
 			}
 		}
 
@@ -112,6 +106,13 @@ var AddTaskToTasklist = common.Shortcut{
 			"successful_tasks": successful,
 			"failed_tasks":     failed,
 			"tasklist_guid":    tasklistGuid,
+		}
+
+		// Item-level failures surface as a non-zero exit (ok:false) so callers
+		// don't have to inspect failed_tasks to detect a partial add; the full
+		// payload (successful + failed) stays on stdout either way.
+		if len(failed) > 0 {
+			return runtime.OutPartialFailure(resultData, nil)
 		}
 
 		runtime.OutFormat(resultData, nil, func(w io.Writer) {

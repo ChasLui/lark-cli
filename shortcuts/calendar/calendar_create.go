@@ -6,29 +6,38 @@ package calendar
 import (
 	"context"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/validate"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
 func buildEventData(runtime *common.RuntimeContext, startTs, endTs string) map[string]interface{} {
+	vchat := map[string]interface{}{"vc_type": "vc"}
+	if ownerId := strings.TrimSpace(runtime.Str("meeting-owner-id")); ownerId != "" {
+		vchat["meeting_settings"] = map[string]interface{}{"owner_id": ownerId}
+	}
 	eventData := map[string]interface{}{
 		"summary":          runtime.Str("summary"),
-		"description":      runtime.Str("description"),
 		"start_time":       map[string]string{"timestamp": startTs},
 		"end_time":         map[string]string{"timestamp": endTs},
 		"attendee_ability": "can_modify_event",
 		"free_busy_status": "busy",
+		"vchat":            vchat,
 		"reminders": []map[string]int{
 			{"minutes": 5},
 		},
 	}
 	if rrule := runtime.Str("rrule"); rrule != "" {
 		eventData["recurrence"] = rrule
+	}
+	if description := descriptionToSend(runtime); description != "" {
+		eventData["description_rich"] = description
 	}
 	return eventData
 }
@@ -58,10 +67,49 @@ func parseAttendees(attendeesStr string, currentUserId string) ([]map[string]str
 		case strings.HasPrefix(id, "ou_"):
 			attendees = append(attendees, map[string]string{"type": "user", "user_id": id})
 		default:
-			return nil, fmt.Errorf("unsupported attendee id format: %s", id)
+			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "unsupported attendee id format: %s", id)
 		}
 	}
 	return attendees, nil
+}
+
+// selfAttendeeId resolves the open_id of the identity running the command so it
+// can be auto-added to the attendee list, mirroring how a human user is joined
+// to their own events. For a user it comes from config; for a bot it is fetched
+// from /bot/v3/info. If the bot lookup fails, we warn and return "" so the event
+// is still created with the explicitly requested attendees.
+func selfAttendeeId(runtime *common.RuntimeContext) string {
+	if !runtime.IsBot() {
+		return runtime.UserOpenId()
+	}
+	info, err := runtime.BotInfo()
+	if err != nil {
+		fmt.Fprintf(runtime.IO().ErrOut,
+			"[calendar +create] warning: could not resolve bot identity to add it as an attendee (%v); proceeding without the bot\n",
+			err)
+		return ""
+	}
+	return info.OpenID
+}
+
+func attendeesIncludeRoom(attendees []map[string]string) bool {
+	for _, attendee := range attendees {
+		if attendee["type"] == "resource" || attendee["room_id"] != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func guideApprovalRoomReasonError(err error, attendees []map[string]string) error {
+	if err == nil || !attendeesIncludeRoom(attendees) {
+		return err
+	}
+	p, ok := errs.ProblemOf(err)
+	if !ok || !strings.Contains(strings.ToLower(p.Hint), "approval_reason") {
+		return err
+	}
+	return withStepContext(err, "approval meeting rooms require attendees[].approval_reason; calendar +create does not expose this low-frequency field. Create the event with the raw API flow, then use `lark-cli calendar event.attendees create --as user` with attendees[].approval_reason for the room attendee.")
 }
 
 var CalendarCreate = common.Shortcut{
@@ -71,20 +119,25 @@ var CalendarCreate = common.Shortcut{
 	Risk:        "write",
 	Scopes:      []string{"calendar:calendar.event:create", "calendar:calendar.event:update"},
 	AuthTypes:   []string{"user", "bot"},
+	HasFormat:   true,
 	Flags: []common.Flag{
 		{Name: "summary", Desc: "event title"},
 		{Name: "start", Desc: "start time (ISO 8601)", Required: true},
 		{Name: "end", Desc: "end time (ISO 8601)", Required: true},
-		{Name: "description", Desc: "event description"},
+		{Name: "description", Desc: "event description as Markdown (@file or - for stdin); the unified description field. Supports bold/italic/underline/strikethrough, links, headings (`#`..`###`), blockquotes (`>`), ordered/unordered lists, horizontal rules (`---`), GFM tables, and images (`![name](url)`; a remote URL is used as-is, and a local image path relative to and inside the current working directory is auto-uploaded to Lark drive and rendered inline — absolute/out-of-cwd paths are rejected). A Lark doc URL (bare or as a Markdown link) is auto-resolved to an inline doc-mention chip showing its title. Inside a GFM table cell, stack multiple lines with `<br>`; each line may itself be an ordered/unordered list item, image or styled text (e.g. `1. a<br>2. b`, `- x<br>- y`, `![p](url)<br>**bold**`).", Input: []string{common.File, common.Stdin}},
 		{Name: "attendee-ids", Desc: "attendee IDs, comma-separated (supports user ou_, chat oc_, room omm_)"},
 		{Name: "calendar-id", Desc: "calendar ID (default: primary)"},
 		{Name: "rrule", Desc: "recurrence rule (rfc5545)"},
+		{Name: "meeting-owner-id", Desc: "VC meeting owner open_id (ou_). Only effective as a bot on the app calendar; owner must be an in-tenant user"},
 	},
 	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		if err := rejectCalendarAutoBotFallback(runtime); err != nil {
+			return err
+		}
 		for _, flag := range []string{"summary", "description", "rrule", "calendar-id"} {
 			if val := runtime.Str(flag); val != "" {
-				if err := common.RejectDangerousChars("--"+flag, val); err != nil {
-					return output.ErrValidation(err.Error())
+				if err := common.RejectDangerousCharsTyped("--"+flag, val); err != nil {
+					return err
 				}
 			}
 		}
@@ -96,36 +149,52 @@ var CalendarCreate = common.Shortcut{
 					continue
 				}
 				if !strings.HasPrefix(id, "ou_") && !strings.HasPrefix(id, "oc_") && !strings.HasPrefix(id, "omm_") {
-					return output.ErrValidation("invalid attendee id format %q: should start with 'ou_', 'oc_', or 'omm_'", id)
+					return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid attendee id format %q: should start with 'ou_', 'oc_', or 'omm_'", id).WithParam("--attendee-ids")
 				}
 			}
 		}
 
+		if ownerId := strings.TrimSpace(runtime.Str("meeting-owner-id")); ownerId != "" {
+			if err := common.RejectDangerousCharsTyped("--meeting-owner-id", ownerId); err != nil {
+				return err
+			}
+			if !strings.HasPrefix(ownerId, "ou_") || ownerId == "ou_" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid --meeting-owner-id %q: meeting owner must be a user open_id starting with 'ou_'", ownerId).WithParam("--meeting-owner-id")
+			}
+			if !runtime.IsBot() {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "--meeting-owner-id only takes effect when running as a bot on the app calendar; re-run with --as bot").WithParam("--meeting-owner-id")
+			}
+		}
+
 		if runtime.Str("start") == "" {
-			return common.FlagErrorf("specify --start (e.g. '2026-03-12T14:00+08:00')")
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "specify --start (e.g. '2026-03-12T14:00+08:00')").WithParam("--start")
 		}
 		if runtime.Str("end") == "" {
-			return common.FlagErrorf("specify --end (e.g. '2026-03-12T15:00+08:00')")
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "specify --end (e.g. '2026-03-12T15:00+08:00')").WithParam("--end")
 		}
 		startTs, err := common.ParseTime(runtime.Str("start"))
 		if err != nil {
-			return common.FlagErrorf("--start: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--start: %v", err).WithParam("--start")
 		}
 		endTs, err := common.ParseTime(runtime.Str("end"), "end")
 		if err != nil {
-			return common.FlagErrorf("--end: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--end: %v", err).WithParam("--end")
 		}
 		s, err := strconv.ParseInt(startTs, 10, 64)
 		if err != nil {
-			return common.FlagErrorf("invalid start time: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid start time: %v", err).WithParam("--start")
 		}
 		e, err := strconv.ParseInt(endTs, 10, 64)
 		if err != nil {
-			return common.FlagErrorf("invalid end time: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid end time: %v", err).WithParam("--end")
 		}
 		if e <= s {
-			return common.FlagErrorf("end time must be after start time")
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "end time must be after start time")
 		}
+		warnCalendarTimezoneMismatch(runtime,
+			calendarTimeInputRange{Flag: "start", Value: runtime.Str("start")},
+			calendarTimeInputRange{Flag: "end", Value: runtime.Str("end")},
+		)
 		return nil
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
@@ -149,7 +218,9 @@ var CalendarCreate = common.Shortcut{
 		eventData := buildEventData(runtime, startTs, endTs)
 		attendeesStr := runtime.Str("attendee-ids")
 		if attendeesStr != "" {
-			// Note: dry-run doesn't network resolve the current user's open_id.
+			// Note: dry-run doesn't network resolve the running identity's own
+			// open_id (user from config, bot from /bot/v3/info), so the auto-joined
+			// self attendee is not shown here.
 			attendees, err := parseAttendees(attendeesStr, "")
 			if err != nil {
 				return common.NewDryRunAPI().Set("error", err.Error())
@@ -177,17 +248,20 @@ var CalendarCreate = common.Shortcut{
 
 		startTs, err := common.ParseTime(runtime.Str("start"))
 		if err != nil {
-			return output.ErrValidation("--start: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--start: %v", err).WithParam("--start")
 		}
 		endTs, err := common.ParseTime(runtime.Str("end"), "end")
 		if err != nil {
-			return output.ErrValidation("--end: %v", err)
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--end: %v", err).WithParam("--end")
+		}
+		if err := resolveDescriptionImages(runtime, calendarId); err != nil {
+			return err
 		}
 
 		eventData := buildEventData(runtime, startTs, endTs)
 
 		// Create event
-		data, err := runtime.CallAPI("POST",
+		data, err := runtime.CallAPITyped("POST",
 			fmt.Sprintf("/open-apis/calendar/v4/calendars/%s/events", validate.EncodePathSegment(calendarId)),
 			nil, eventData)
 		if err != nil {
@@ -196,21 +270,18 @@ var CalendarCreate = common.Shortcut{
 		event, _ := data["event"].(map[string]interface{})
 		eventId, _ := event["event_id"].(string)
 		if eventId == "" {
-			return output.Errorf(output.ExitAPI, "api_error", "failed to create event: no event_id returned")
+			return errs.NewInternalError(errs.SubtypeInvalidResponse, "failed to create event: no event_id returned")
 		}
 
 		// Add attendees if specified
 		if attendeesStr := runtime.Str("attendee-ids"); attendeesStr != "" {
-			currentUserId := ""
-			if !runtime.IsBot() {
-				currentUserId = runtime.UserOpenId()
-			}
-			attendees, err := parseAttendees(attendeesStr, currentUserId)
+			selfId := selfAttendeeId(runtime)
+			attendees, err := parseAttendees(attendeesStr, selfId)
 			if err != nil {
-				return output.ErrValidation("invalid attendee id: %v", err)
+				return withParam(err, "--attendee-ids")
 			}
 
-			_, err = runtime.CallAPI("POST",
+			_, err = runtime.CallAPITyped("POST",
 				fmt.Sprintf("/open-apis/calendar/v4/calendars/%s/events/%s/attendees", validate.EncodePathSegment(calendarId), validate.EncodePathSegment(eventId)),
 				map[string]interface{}{"user_id_type": "open_id"},
 				map[string]interface{}{
@@ -218,14 +289,15 @@ var CalendarCreate = common.Shortcut{
 					"need_notification": true,
 				})
 			if err != nil {
+				err = guideApprovalRoomReasonError(err, attendees)
 				// Rollback: delete the event
-				_, rollbackErr := runtime.RawAPI("DELETE",
+				_, rollbackErr := runtime.CallAPITyped("DELETE",
 					fmt.Sprintf("/open-apis/calendar/v4/calendars/%s/events/%s", validate.EncodePathSegment(calendarId), validate.EncodePathSegment(eventId)),
 					map[string]interface{}{"need_notification": false}, nil)
 				if rollbackErr != nil {
-					return output.Errorf(output.ExitAPI, "api_error", "failed to add attendees: %v; rollback also failed, orphan event_id=%s needs manual cleanup", rollbackErr, eventId)
+					return withStepContext(err, "rollback also failed (%v); orphan event_id=%s needs manual cleanup", rollbackErr, eventId)
 				}
-				return output.Errorf(output.ExitAPI, "api_error", "failed to add attendees: %v; event rolled back successfully", err)
+				return withStepContext(err, "event rolled back successfully")
 			}
 		}
 
@@ -272,12 +344,22 @@ var CalendarCreate = common.Shortcut{
 			}
 		}
 
-		runtime.Out(map[string]interface{}{
+		resultData := map[string]interface{}{
 			"event_id": eventId,
 			"summary":  event["summary"],
 			"start":    startStr,
 			"end":      endStr,
-		}, nil)
+		}
+		if recurrence, _ := event["recurrence"].(string); recurrence != "" {
+			resultData["recurrence"] = recurrence
+		}
+
+		runtime.OutFormat(resultData, nil, func(w io.Writer) {
+			var rows []map[string]interface{}
+			rows = append(rows, resultData)
+			output.PrintTable(w, rows)
+			fmt.Fprintln(w, "\nEvent created successfully")
+		})
 		return nil
 	},
 }

@@ -12,8 +12,7 @@ import (
 	"net/url"
 	"strings"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
-
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/shortcuts/common"
 )
@@ -28,11 +27,16 @@ var UpdateTask = common.Shortcut{
 	HasFormat:   true,
 
 	Flags: []common.Flag{
-		{Name: "task-id", Desc: "task id (comma-separated for multiple)", Required: true},
+		{Name: "task-id", Desc: "task GUID or task applink URL (comma-separated for multiple)", Required: true},
 		{Name: "summary", Desc: "task title"},
 		{Name: "description", Desc: "task description"},
 		{Name: "due", Desc: "due date (ISO 8601 / date:YYYY-MM-DD / relative:+2d / ms timestamp)"},
 		{Name: "data", Desc: "JSON payload for task object"},
+	},
+
+	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		_, err := parseTaskGUIDs(runtime.Str("task-id"))
+		return err
 	},
 
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
@@ -40,47 +44,37 @@ var UpdateTask = common.Shortcut{
 		if err != nil {
 			return common.NewDryRunAPI().Set("error", err.Error())
 		}
-		taskIds := strings.Split(runtime.Str("task-id"), ",")
-		taskId := url.PathEscape(strings.TrimSpace(taskIds[0]))
-		return common.NewDryRunAPI().
-			PATCH("/open-apis/task/v2/tasks/" + taskId).
-			Params(map[string]interface{}{"user_id_type": "open_id"}).
-			Body(body)
+		taskIDs, err := parseTaskGUIDs(runtime.Str("task-id"))
+		if err != nil {
+			return common.NewDryRunAPI().Set("error", err.Error())
+		}
+		preview := common.NewDryRunAPI()
+		for _, taskID := range taskIDs {
+			preview.PATCH("/open-apis/task/v2/tasks/" + url.PathEscape(taskID)).
+				Params(map[string]interface{}{"user_id_type": "open_id"}).
+				Body(body)
+		}
+		return preview
 	},
 
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
-		body, err := buildTaskUpdateBody(runtime)
+		taskIDs, err := parseTaskGUIDs(runtime.Str("task-id"))
 		if err != nil {
-			return WrapTaskError(ErrCodeTaskInvalidParams, err.Error(), "update task")
+			return err
 		}
 
-		taskIds := strings.Split(runtime.Str("task-id"), ",")
+		body, err := buildTaskUpdateBody(runtime)
+		if err != nil {
+			// buildTaskUpdateBody already returns a typed validation error;
+			// propagate it directly instead of re-wrapping as an API error.
+			return err
+		}
+
 		var updatedTasks []map[string]interface{}
 
-		for _, taskId := range taskIds {
-			taskId = strings.TrimSpace(taskId)
-			if taskId == "" {
-				continue
-			}
-
-			queryParams := make(larkcore.QueryParams)
-			queryParams.Set("user_id_type", "open_id")
-
-			apiResp, err := runtime.DoAPI(&larkcore.ApiReq{
-				HttpMethod:  http.MethodPatch,
-				ApiPath:     "/open-apis/task/v2/tasks/" + url.PathEscape(taskId),
-				QueryParams: queryParams,
-				Body:        body,
-			})
-
-			var result map[string]interface{}
-			if err == nil {
-				if parseErr := json.Unmarshal(apiResp.RawBody, &result); parseErr != nil {
-					return fmt.Errorf("failed to parse response for task %s: %v", taskId, parseErr)
-				}
-			}
-
-			data, err := HandleTaskApiResult(result, err, "update task "+taskId)
+		for _, taskID := range taskIDs {
+			params := map[string]interface{}{"user_id_type": "open_id"}
+			data, err := callTaskAPITyped(runtime, http.MethodPatch, "/open-apis/task/v2/tasks/"+url.PathEscape(taskID), params, body)
 			if err != nil {
 				return err
 			}
@@ -91,19 +85,30 @@ var UpdateTask = common.Shortcut{
 			}
 		}
 
+		updateFields, _ := body["update_fields"].([]string)
 		var tasks []map[string]interface{}
 		for _, task := range updatedTasks {
 			guid, _ := task["guid"].(string)
 			urlVal, _ := task["url"].(string)
 			urlVal = truncateTaskURL(urlVal)
-			tasks = append(tasks, map[string]interface{}{
-				"guid": guid,
-				"url":  urlVal,
-			})
+			confirmed := make(map[string]interface{})
+			for _, field := range updateFields {
+				if value, ok := task[field]; ok {
+					confirmed[field] = value
+				}
+			}
+			item := map[string]interface{}{
+				"guid":      guid,
+				"url":       urlVal,
+				"confirmed": confirmed,
+			}
+			projectTaskFields(item, task, standardTaskOutputFields...)
+			tasks = append(tasks, item)
 		}
 		// Standardized write output: return resource identifiers
 		outData := map[string]interface{}{
-			"tasks": tasks,
+			"updated_fields": updateFields,
+			"tasks":          tasks,
 		}
 
 		runtime.OutFormat(outData, &output.Meta{Count: len(updatedTasks)}, func(w io.Writer) {
@@ -127,13 +132,33 @@ var UpdateTask = common.Shortcut{
 	},
 }
 
+func parseTaskGUIDs(input string) ([]string, error) {
+	parts := strings.Split(input, ",")
+	taskGUIDs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		guid, err := parseTaskGUID(part)
+		if err != nil {
+			return nil, err
+		}
+		taskGUIDs = append(taskGUIDs, guid)
+	}
+	if len(taskGUIDs) == 0 {
+		_, err := parseTaskGUID("")
+		return nil, err
+	}
+	return taskGUIDs, nil
+}
+
 func buildTaskUpdateBody(runtime *common.RuntimeContext) (map[string]interface{}, error) {
 	taskObj := make(map[string]interface{})
 	var updateFields []string
 
 	if dataStr := runtime.Str("data"); dataStr != "" {
 		if err := json.Unmarshal([]byte(dataStr), &taskObj); err != nil {
-			return nil, fmt.Errorf("--data must be a valid JSON object: %v", err)
+			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "--data must be a valid JSON object: %v", err).WithParam("--data")
 		}
 		// If data is provided, assume keys are update fields
 		for k := range taskObj {
@@ -158,7 +183,7 @@ func buildTaskUpdateBody(runtime *common.RuntimeContext) (map[string]interface{}
 	if dueStr := runtime.Str("due"); dueStr != "" {
 		dueObj, err := parseTaskTime(dueStr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse due time: %v", err)
+			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "failed to parse due time: %v", err).WithParam("--due")
 		}
 		taskObj["due"] = dueObj
 		if !contains(updateFields, "due") {
@@ -167,7 +192,7 @@ func buildTaskUpdateBody(runtime *common.RuntimeContext) (map[string]interface{}
 	}
 
 	if len(updateFields) == 0 {
-		return nil, fmt.Errorf("no fields to update")
+		return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "no fields to update")
 	}
 
 	return map[string]interface{}{

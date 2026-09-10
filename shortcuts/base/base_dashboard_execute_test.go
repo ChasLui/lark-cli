@@ -4,18 +4,20 @@
 package base
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/httpmock"
 )
 
 // ── Dashboard CRUD ──────────────────────────────────────────────────
 
+// TestBaseDashboardExecuteList tests the +dashboard-list command.
 func TestBaseDashboardExecuteList(t *testing.T) {
 	t.Run("single page", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "GET",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards",
@@ -42,9 +44,9 @@ func TestBaseDashboardExecuteList(t *testing.T) {
 
 }
 
+// TestBaseDashboardExecuteGet tests the +dashboard-get command.
 func TestBaseDashboardExecuteGet(t *testing.T) {
 	factory, stdout, reg := newExecuteFactory(t)
-	registerTokenStub(reg)
 	reg.Register(&httpmock.Stub{
 		Method: "GET",
 		URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001",
@@ -69,10 +71,10 @@ func TestBaseDashboardExecuteGet(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardExecuteCreate tests the +dashboard-create command.
 func TestBaseDashboardExecuteCreate(t *testing.T) {
 	t.Run("name only", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "POST",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards",
@@ -95,7 +97,6 @@ func TestBaseDashboardExecuteCreate(t *testing.T) {
 
 	t.Run("with theme", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "POST",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards",
@@ -118,10 +119,10 @@ func TestBaseDashboardExecuteCreate(t *testing.T) {
 	})
 }
 
+// TestBaseDashboardExecuteUpdate tests the +dashboard-update command.
 func TestBaseDashboardExecuteUpdate(t *testing.T) {
 	t.Run("update name", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "PATCH",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001",
@@ -144,7 +145,6 @@ func TestBaseDashboardExecuteUpdate(t *testing.T) {
 
 	t.Run("update theme", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "PATCH",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001",
@@ -167,9 +167,9 @@ func TestBaseDashboardExecuteUpdate(t *testing.T) {
 	})
 }
 
+// TestBaseDashboardExecuteDelete tests the +dashboard-delete command.
 func TestBaseDashboardExecuteDelete(t *testing.T) {
 	factory, stdout, reg := newExecuteFactory(t)
-	registerTokenStub(reg)
 	reg.Register(&httpmock.Stub{
 		Method: "DELETE",
 		URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001",
@@ -186,10 +186,10 @@ func TestBaseDashboardExecuteDelete(t *testing.T) {
 
 // ── Dashboard Block CRUD ────────────────────────────────────────────
 
+// TestBaseDashboardBlockExecuteList tests the +dashboard-block-list command.
 func TestBaseDashboardBlockExecuteList(t *testing.T) {
 	t.Run("single page", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "GET",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks",
@@ -216,10 +216,10 @@ func TestBaseDashboardBlockExecuteList(t *testing.T) {
 
 }
 
+// TestBaseDashboardBlockExecuteGet tests the +dashboard-block-get command.
 func TestBaseDashboardBlockExecuteGet(t *testing.T) {
 	t.Run("basic", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "GET",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
@@ -248,7 +248,6 @@ func TestBaseDashboardBlockExecuteGet(t *testing.T) {
 
 	t.Run("with user-id-type", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "GET",
 			URL:    "user_id_type=union_id",
@@ -271,10 +270,43 @@ func TestBaseDashboardBlockExecuteGet(t *testing.T) {
 	})
 }
 
+// TestBaseDashboardBlockExecuteGetData tests the +dashboard-block-get-data command.
+func TestBaseDashboardBlockExecuteGetData(t *testing.T) {
+	factory, stdout, reg := newExecuteFactory(t)
+	reg.Register(&httpmock.Stub{
+		Method: "GET",
+		URL:    "/open-apis/base/v3/bases/app_x/dashboards/blocks/blk_chart/data",
+		Body: map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"dimensions": []interface{}{
+					map[string]interface{}{"field_name": "文本", "alias": "dim_text"},
+				},
+				"measures": []interface{}{
+					map[string]interface{}{"field_name": "Bitable_Dashboard_Count", "aggregation": "count_all", "alias": "me_count"},
+				},
+				"main_data": []interface{}{
+					map[string]interface{}{
+						"dim_text": map[string]interface{}{"value": "A"},
+						"me_count": map[string]interface{}{"value": 3},
+					},
+				},
+			},
+		},
+	})
+	if err := runShortcut(t, BaseDashboardBlockGetData, []string{"+dashboard-block-get-data", "--base-token", "app_x", "--block-id", "blk_chart"}, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, `"dimensions"`) || !strings.Contains(got, `"main_data"`) || !strings.Contains(got, `"dim_text"`) {
+		t.Fatalf("stdout=%s", got)
+	}
+}
+
+// TestBaseDashboardBlockExecuteCreate tests the +dashboard-block-create command.
 func TestBaseDashboardBlockExecuteCreate(t *testing.T) {
 	t.Run("with data-config", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "POST",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks",
@@ -306,7 +338,6 @@ func TestBaseDashboardBlockExecuteCreate(t *testing.T) {
 
 	t.Run("statistics with series", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "POST",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks",
@@ -333,7 +364,6 @@ func TestBaseDashboardBlockExecuteCreate(t *testing.T) {
 
 	t.Run("without data-config", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "POST",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks",
@@ -367,10 +397,12 @@ func TestBaseDashboardBlockExecuteCreate(t *testing.T) {
 	})
 }
 
+// TestBaseDashboardBlockExecuteUpdate tests the +dashboard-block-update command.
 func TestBaseDashboardBlockExecuteUpdate(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
 	t.Run("update name and data-config", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "PATCH",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
@@ -401,7 +433,6 @@ func TestBaseDashboardBlockExecuteUpdate(t *testing.T) {
 
 	t.Run("update name only", func(t *testing.T) {
 		factory, stdout, reg := newExecuteFactory(t)
-		registerTokenStub(reg)
 		reg.Register(&httpmock.Stub{
 			Method: "PATCH",
 			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
@@ -433,11 +464,96 @@ func TestBaseDashboardBlockExecuteUpdate(t *testing.T) {
 			t.Fatalf("expected error for invalid data-config JSON")
 		}
 	})
+
+	t.Run("filter operator requiring value rejects missing value before request", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		stub := &httpmock.Stub{
+			Method:   "PATCH",
+			URL:      "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
+			Body:     map[string]interface{}{"code": 0, "data": map[string]interface{}{"block_id": "blk_a"}},
+			Optional: true,
+		}
+		reg.Register(stub)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"is"}]}}`}
+		err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout)
+		var validationErr *errs.ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("err type=%T want *errs.ValidationError: %v", err, err)
+		}
+		if validationErr.Subtype != errs.SubtypeInvalidArgument || validationErr.Param != "--data-config" {
+			t.Fatalf("problem=%#v want invalid_argument param --data-config", validationErr.Problem)
+		}
+		if !strings.Contains(validationErr.Message, "filter.conditions[0].value 缺失") {
+			t.Fatalf("message=%q missing precise filter path", validationErr.Message)
+		}
+		if !strings.Contains(validationErr.Hint, "lark-base-dashboard-block-config.md") {
+			t.Fatalf("hint=%q missing data_config recovery reference", validationErr.Hint)
+		}
+		if len(stub.CapturedBodies) != 0 {
+			t.Fatalf("validation failure must not send PATCH, captured=%d", len(stub.CapturedBodies))
+		}
+	})
+
+	t.Run("empty filter operators do not require value", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		stub := &httpmock.Stub{
+			Method: "PATCH",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
+			Body:   map[string]interface{}{"code": 0, "data": map[string]interface{}{"block_id": "blk_a"}},
+		}
+		reg.Register(stub)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"isEmpty"},{"field_name":"Region","operator":"isNotEmpty"}]}}`}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("empty operators without value must remain valid: %v", err)
+		}
+		if len(stub.CapturedBodies) != 1 {
+			t.Fatalf("valid empty filter must send one PATCH, captured=%d", len(stub.CapturedBodies))
+		}
+	})
+
+	t.Run("filter accepts field_id references", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		stub := &httpmock.Stub{
+			Method: "PATCH",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
+			Body:   map[string]interface{}{"code": 0, "data": map[string]interface{}{"block_id": "blk_a"}},
+		}
+		reg.Register(stub)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_id":"fld_segment","operator":"is","value":["Enterprise"]}]}}`}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("field_id filters must remain valid on update: %v", err)
+		}
+		if len(stub.CapturedBodies) != 1 {
+			t.Fatalf("valid field_id filter must send one PATCH, captured=%d", len(stub.CapturedBodies))
+		}
+	})
+
+	t.Run("no-validate bypasses filter validation", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		stub := &httpmock.Stub{
+			Method: "PATCH",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
+			Body:   map[string]interface{}{"code": 0, "data": map[string]interface{}{"block_id": "blk_a"}},
+		}
+		reg.Register(stub)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"is"}]}}`,
+			"--no-validate"}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("--no-validate must bypass filter validation: %v", err)
+		}
+		if len(stub.CapturedBodies) != 1 {
+			t.Fatalf("bypassed filter must send one PATCH, captured=%d", len(stub.CapturedBodies))
+		}
+	})
 }
 
+// TestBaseDashboardBlockExecuteDelete tests the +dashboard-block-delete command.
 func TestBaseDashboardBlockExecuteDelete(t *testing.T) {
 	factory, stdout, reg := newExecuteFactory(t)
-	registerTokenStub(reg)
 	reg.Register(&httpmock.Stub{
 		Method: "DELETE",
 		URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_a",
@@ -454,6 +570,7 @@ func TestBaseDashboardBlockExecuteDelete(t *testing.T) {
 
 // ── Dry Run: Dashboard & Blocks ──────────────────────────────────────
 
+// TestBaseDashboardDryRun_List tests the +dashboard-list --dry-run flag.
 func TestBaseDashboardDryRun_List(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	if err := runShortcut(t, BaseDashboardList, []string{"+dashboard-list", "--base-token", "app_x", "--page-size", "50", "--dry-run", "--format", "pretty"}, factory, stdout); err != nil {
@@ -465,6 +582,7 @@ func TestBaseDashboardDryRun_List(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardDryRun_Get tests the +dashboard-get --dry-run flag.
 func TestBaseDashboardDryRun_Get(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	if err := runShortcut(t, BaseDashboardGet, []string{"+dashboard-get", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--dry-run", "--format", "pretty"}, factory, stdout); err != nil {
@@ -476,6 +594,7 @@ func TestBaseDashboardDryRun_Get(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardDryRun_Create tests the +dashboard-create --dry-run flag.
 func TestBaseDashboardDryRun_Create(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-create", "--base-token", "app_x", "--name", "新报表", "--theme-style", "default", "--dry-run", "--format", "pretty"}
@@ -488,6 +607,7 @@ func TestBaseDashboardDryRun_Create(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardDryRun_Update tests the +dashboard-update --dry-run flag.
 func TestBaseDashboardDryRun_Update(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--name", "更新名", "--dry-run", "--format", "pretty"}
@@ -500,6 +620,7 @@ func TestBaseDashboardDryRun_Update(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardDryRun_Delete tests the +dashboard-delete --dry-run flag.
 func TestBaseDashboardDryRun_Delete(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-delete", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--dry-run", "--format", "pretty"}
@@ -512,6 +633,7 @@ func TestBaseDashboardDryRun_Delete(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardBlockDryRun_List tests the +dashboard-block-list --dry-run flag.
 func TestBaseDashboardBlockDryRun_List(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-block-list", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--page-size", "10", "--dry-run", "--format", "pretty"}
@@ -524,6 +646,7 @@ func TestBaseDashboardBlockDryRun_List(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardBlockDryRun_Get tests the +dashboard-block-get --dry-run flag.
 func TestBaseDashboardBlockDryRun_Get(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-block-get", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a", "--user-id-type", "union_id", "--dry-run", "--format", "pretty"}
@@ -536,6 +659,20 @@ func TestBaseDashboardBlockDryRun_Get(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardBlockDryRun_GetData tests the +dashboard-block-get-data --dry-run flag.
+func TestBaseDashboardBlockDryRun_GetData(t *testing.T) {
+	factory, stdout, _ := newExecuteFactory(t)
+	args := []string{"+dashboard-block-get-data", "--base-token", "app_x", "--block-id", "blk_a", "--dry-run", "--format", "pretty"}
+	if err := runShortcut(t, BaseDashboardBlockGetData, args, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "GET /open-apis/base/v3/bases/app_x/dashboards/blocks/blk_a/data") || !strings.Contains(got, "blk_a") {
+		t.Fatalf("stdout=%s", got)
+	}
+}
+
+// TestBaseDashboardBlockDryRun_Create tests the +dashboard-block-create --dry-run flag.
 func TestBaseDashboardBlockDryRun_Create(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--name", "订单趋势", "--type", "column", "--data-config", `{"table_name":"订单表","count_all":true}`, "--user-id-type", "open_id", "--dry-run", "--format", "pretty"}
@@ -548,6 +685,23 @@ func TestBaseDashboardBlockDryRun_Create(t *testing.T) {
 	}
 }
 
+func TestBaseDashboardBlockDryRun_CreateRankingDefaults(t *testing.T) {
+	factory, stdout, _ := newExecuteFactory(t)
+	args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--name", "负责人排行", "--type", "ranking",
+		"--data-config", `{"table_name":"订单表","group_by":[{"field_name":"负责人"}],"series":[{"field_name":"金额","rollup":"sum"}]}`,
+		"--dry-run", "--format", "pretty"}
+	if err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	got := stdout.String()
+	for _, want := range []string{`"type":"ranking"`, `"limit_size":10`, `"rollup":"SUM"`, `"sort":{"order":"desc","type":"value"}`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stdout missing %s: %s", want, got)
+		}
+	}
+}
+
+// TestBaseDashboardBlockDryRun_Update tests the +dashboard-block-update --dry-run flag.
 func TestBaseDashboardBlockDryRun_Update(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a", "--name", "订单趋势v2", "--data-config", `{"table_name":"订单表2","count_all":true}`, "--dry-run", "--format", "pretty"}
@@ -560,6 +714,91 @@ func TestBaseDashboardBlockDryRun_Update(t *testing.T) {
 	}
 }
 
+func TestBaseDashboardBlockDryRun_UpdateFilterValidation(t *testing.T) {
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+
+	t.Run("rejects missing value", func(t *testing.T) {
+		factory, stdout, _ := newExecuteFactory(t)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"is"}]}}`,
+			"--dry-run"}
+		err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout)
+		var validationErr *errs.ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("err type=%T want *errs.ValidationError: %v", err, err)
+		}
+		if validationErr.Subtype != errs.SubtypeInvalidArgument || validationErr.Param != "--data-config" ||
+			!strings.Contains(validationErr.Message, "filter.conditions[0].value 缺失") {
+			t.Fatalf("unexpected validation error: %#v", validationErr.Problem)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("rejected dry-run must not print a request preview: %s", stdout.String())
+		}
+	})
+
+	t.Run("previews empty operators without value", func(t *testing.T) {
+		factory, stdout, _ := newExecuteFactory(t)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"isEmpty"},{"field_name":"Region","operator":"isNotEmpty"}]}}`,
+			"--dry-run", "--format", "pretty"}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("empty operators without value must remain valid: %v", err)
+		}
+		got := stdout.String()
+		for _, want := range []string{"PATCH /open-apis/base/v3/bases/app_x/dashboards/dsh_1/blocks/blk_a", `"operator":"isEmpty"`, `"operator":"isNotEmpty"`} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("dry-run missing %s: %s", want, got)
+			}
+		}
+	})
+
+	t.Run("no-validate preserves missing value in preview", func(t *testing.T) {
+		factory, stdout, _ := newExecuteFactory(t)
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a",
+			"--data-config", `{"filter":{"conjunction":"and","conditions":[{"field_name":"Segment","operator":"is"}]}}`,
+			"--no-validate", "--dry-run"}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("--no-validate dry-run must preserve the filter: %v", err)
+		}
+		body, call := dryRunPreviewBody(t, stdout.Bytes())
+		if call.Method != "PATCH" || call.URL != "/open-apis/base/v3/bases/app_x/dashboards/dsh_1/blocks/blk_a" {
+			t.Fatalf("unexpected preview call: %#v", call)
+		}
+		dataConfig, _ := body["data_config"].(map[string]interface{})
+		filter, _ := dataConfig["filter"].(map[string]interface{})
+		conditions, _ := filter["conditions"].([]interface{})
+		if len(conditions) != 1 {
+			t.Fatalf("preview lost filter condition: %#v", body)
+		}
+		condition, _ := conditions[0].(map[string]interface{})
+		if condition["field_name"] != "Segment" || condition["operator"] != "is" {
+			t.Fatalf("preview rewrote filter condition: %#v", condition)
+		}
+		if _, hasValue := condition["value"]; hasValue {
+			t.Fatalf("preview injected omitted value: %#v", condition)
+		}
+	})
+}
+
+func TestBaseDashboardBlockDryRun_UpdateRankingKeepsPatch(t *testing.T) {
+	factory, stdout, _ := newExecuteFactory(t)
+	args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_ranking",
+		"--data-config", `{"limit_size":20}`, "--dry-run", "--format", "pretty"}
+	if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, `"data_config":{"limit_size":20}`) {
+		t.Fatalf("stdout=%s", got)
+	}
+	for _, unwanted := range []string{`"group_by"`, `"series"`, `"count_all"`, `"sort"`} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("update must preserve the top-level patch, found %s in %s", unwanted, got)
+		}
+	}
+}
+
+// TestBaseDashboardBlockDryRun_Delete tests the +dashboard-block-delete --dry-run flag.
 func TestBaseDashboardBlockDryRun_Delete(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	args := []string{"+dashboard-block-delete", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--block-id", "blk_a", "--dry-run", "--format", "pretty"}
@@ -574,6 +813,7 @@ func TestBaseDashboardBlockDryRun_Delete(t *testing.T) {
 
 // ── Validator: data_config ───────────────────────────────────────────
 
+// TestBaseDashboardBlockCreate_ValidateFails tests that data_config validation catches missing table_name.
 func TestBaseDashboardBlockCreate_ValidateFails(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	// 缺 table_name 且 series 与 count_all 同时存在
@@ -590,9 +830,9 @@ func TestBaseDashboardBlockCreate_ValidateFails(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardBlockCreate_NoValidateFlagAllocs tests that --no-validate flag skips client-side validation.
 func TestBaseDashboardBlockCreate_NoValidateFlagAllocs(t *testing.T) {
 	factory, stdout, reg := newExecuteFactory(t)
-	registerTokenStub(reg)
 	reg.Register(&httpmock.Stub{Method: "POST", URL: "/open-apis/base/v3/bases/app_x/dashboards/dsh_1/blocks",
 		Body: map[string]interface{}{"code": 0, "data": map[string]interface{}{"block_id": "blk_ok", "name": "OK", "type": "column"}},
 	})
@@ -608,6 +848,7 @@ func TestBaseDashboardBlockCreate_NoValidateFlagAllocs(t *testing.T) {
 	}
 }
 
+// TestBaseDashboardBlockCreate_InvalidRollup tests that invalid rollup values are rejected during validation.
 func TestBaseDashboardBlockCreate_InvalidRollup(t *testing.T) {
 	factory, stdout, _ := newExecuteFactory(t)
 	// 合法 JSON，但 rollup=COUNTA（不支持）
@@ -621,5 +862,375 @@ func TestBaseDashboardBlockCreate_InvalidRollup(t *testing.T) {
 	}
 	if got := err.Error(); !strings.Contains(got, "rollup") || !strings.Contains(got, "data_config 校验失败") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBaseDashboardBlockCreate_RankingValidation(t *testing.T) {
+	validPrefix := `{"table_name":"T","group_by":[{"field_name":"负责人"}],`
+	tests := []struct {
+		name       string
+		dataConfig string
+		want       string
+	}{
+		{name: "missing data config", want: "ranking 类型组件必须提供 data-config"},
+		{name: "missing metric", dataConfig: `{"table_name":"T","group_by":[{"field_name":"负责人"}]}`, want: "二选一"},
+		{name: "multiple series", dataConfig: validPrefix + `"series":[{"field_name":"金额","rollup":"SUM"},{"field_name":"数量","rollup":"SUM"}]}`, want: "严格包含 1 个指标"},
+		{name: "multiple groups", dataConfig: `{"table_name":"T","count_all":true,"group_by":[{"field_name":"负责人"},{"field_name":"区域"}]}`, want: "严格包含 1 个分组"},
+		{name: "top level sort", dataConfig: validPrefix + `"count_all":true,"sort":{"type":"value","order":"desc"}}`, want: "不支持顶层 sort"},
+		{name: "invalid limit", dataConfig: validPrefix + `"count_all":true,"limit_size":501}`, want: "1..500"},
+		{name: "unknown top level field", dataConfig: validPrefix + `"count_all":true,"limit_siz":10}`, want: "limit_siz"},
+		{name: "filter must be object", dataConfig: validPrefix + `"count_all":true,"filter":"all"}`, want: "filter"},
+		{name: "invalid group sort", dataConfig: `{"table_name":"T","count_all":true,"group_by":[{"field_name":"负责人","sort":{"type":"group","order":"desc"}}]}`, want: "只能为 value"},
+		{name: "extra series field", dataConfig: validPrefix + `"series":[{"field_name":"金额","rollup":"SUM","formula":"x"}]}`, want: "series[0] 不支持字段 formula"},
+		{name: "extra group field", dataConfig: `{"table_name":"T","count_all":true,"group_by":[{"field_name":"负责人","table_id":"tbl_x"}]}`, want: "group_by[0] 不支持字段 table_id"},
+		{name: "extra sort field", dataConfig: `{"table_name":"T","count_all":true,"group_by":[{"field_name":"负责人","sort":{"type":"value","order":"desc","nulls":"last"}}]}`, want: "sort 不支持字段 nulls"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			factory, stdout, _ := newExecuteFactory(t)
+			args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1", "--name", "Bad", "--type", "ranking"}
+			if tc.dataConfig != "" {
+				args = append(args, "--data-config", tc.dataConfig)
+			}
+			err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout)
+			if err == nil {
+				t.Fatalf("expected validation error, got nil (stdout=%s)", stdout.String())
+			}
+			var ve *errs.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *errs.ValidationError, got %T %v", err, err)
+			}
+			if ve.Category != errs.CategoryValidation || ve.Subtype != errs.SubtypeInvalidArgument {
+				t.Fatalf("category=%q subtype=%q, want validation/invalid_argument", ve.Category, ve.Subtype)
+			}
+			if ve.Param != "--data-config" {
+				t.Fatalf("param=%q, want --data-config", ve.Param)
+			}
+			if !strings.Contains(ve.Error(), tc.want) {
+				t.Fatalf("err=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestBaseDashboardBlockCreate_IllegalSortOrderType guards against a P1 where a
+// non-string sort.order (123 / null / false) was silently coerced to "asc" and
+// created a block with a tampered sort. A present-but-illegal order must now
+// surface a typed validation error, never a silent default.
+func TestBaseDashboardBlockCreate_IllegalSortOrderType(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order string // raw JSON literal for the order value
+	}{
+		{"number", "123"},
+		{"null", "null"},
+		{"bool", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			factory, stdout, _ := newExecuteFactory(t)
+			dc := `{"table_name":"T","series":[{"field_name":"金额","rollup":"SUM"}],` +
+				`"group_by":[{"field_name":"状态","mode":"integrated","sort":{"type":"group","order":` + tc.order + `}}]}`
+			args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1",
+				"--name", "Bad", "--type", "column", "--data-config", dc}
+			err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout)
+			if err == nil {
+				t.Fatalf("expected validation error for order=%s, got nil (stdout=%s)", tc.order, stdout.String())
+			}
+			var ve *errs.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *errs.ValidationError, got %T %v", err, err)
+			}
+			if ve.Category != errs.CategoryValidation || ve.Subtype != errs.SubtypeInvalidArgument {
+				t.Fatalf("category=%q subtype=%q, want validation/invalid_argument", ve.Category, ve.Subtype)
+			}
+			if ve.Param != "--data-config" {
+				t.Fatalf("param=%q, want --data-config", ve.Param)
+			}
+			if !strings.Contains(ve.Error(), "sort.order") {
+				t.Fatalf("error should name sort.order, got: %v", ve)
+			}
+		})
+	}
+}
+
+// TestBaseDashboardBlockCreate_MissingSortOrder pins the full create-path behavior
+// when sort.order is absent: group/view are normalized to order:"asc" and succeed
+// (matching the documented auto-fill), while value has no safe default and must
+// surface a typed validation error. These run end-to-end (Validate → normalize →
+// validate), so reverting the normalize/validate change flips a case and fails.
+func TestBaseDashboardBlockCreate_MissingSortOrder(t *testing.T) {
+	dc := func(sortType string) string {
+		return `{"table_name":"T","series":[{"field_name":"金额","rollup":"SUM"}],` +
+			`"group_by":[{"field_name":"状态","mode":"integrated","sort":{"type":"` + sortType + `"}}]}`
+	}
+
+	// group / view: absent order is auto-filled with "asc" and the request goes through.
+	for _, sortType := range []string{"group", "view"} {
+		t.Run(sortType+" defaults to asc", func(t *testing.T) {
+			factory, stdout, _ := newExecuteFactory(t)
+			args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1",
+				"--name", "OK", "--type", "column", "--data-config", dc(sortType),
+				"--dry-run", "--format", "pretty"}
+			if err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout); err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if got := stdout.String(); !strings.Contains(got, `"order":"asc"`) {
+				t.Fatalf("expected normalized order:asc for type=%s, stdout=%s", sortType, got)
+			}
+		})
+	}
+
+	// value: no meaningful default direction, so a missing order is a typed error.
+	t.Run("value requires explicit order", func(t *testing.T) {
+		factory, stdout, _ := newExecuteFactory(t)
+		args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_1",
+			"--name", "Bad", "--type", "column", "--data-config", dc("value")}
+		err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout)
+		if err == nil {
+			t.Fatalf("expected validation error for value sort missing order, got nil (stdout=%s)", stdout.String())
+		}
+		p, ok := errs.ProblemOf(err)
+		if !ok || p.Category != errs.CategoryValidation || p.Subtype != errs.SubtypeInvalidArgument {
+			t.Fatalf("expected validation/invalid_argument problem, got %T %v", err, err)
+		}
+		var ve *errs.ValidationError
+		if !errors.As(err, &ve) || ve.Param != "--data-config" {
+			t.Fatalf("expected param --data-config, got %T %v", err, err)
+		}
+		if !strings.Contains(ve.Error(), "sort.order 缺失") {
+			t.Fatalf("error should report missing order, got: %v", ve)
+		}
+	})
+}
+
+// TestNormalizeDataConfigSortOrder pins the normalization contract for sort.order:
+// only a truly absent key gets the "asc" default; a present illegal value is left
+// untouched so validation can reject it; a valid string is lower-cased.
+func TestNormalizeDataConfigSortOrder(t *testing.T) {
+	sortOf := func(cfg map[string]interface{}) map[string]interface{} {
+		gb := cfg["group_by"].([]interface{})
+		return gb[0].(map[string]interface{})["sort"].(map[string]interface{})
+	}
+	newCfg := func(sort map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{
+			"table_name": "T",
+			"series":     []interface{}{map[string]interface{}{"field_name": "v", "rollup": "sum"}},
+			"group_by":   []interface{}{map[string]interface{}{"field_name": "g", "sort": sort}},
+		}
+	}
+
+	t.Run("absent order defaults to asc for group", func(t *testing.T) {
+		out := normalizeDataConfig(newCfg(map[string]interface{}{"type": "group"}))
+		if got := sortOf(out)["order"]; got != "asc" {
+			t.Fatalf("order=%v, want asc", got)
+		}
+	})
+	t.Run("absent order not defaulted for value", func(t *testing.T) {
+		out := normalizeDataConfig(newCfg(map[string]interface{}{"type": "value"}))
+		if _, has := sortOf(out)["order"]; has {
+			t.Fatalf("value sort must not get a defaulted order: %v", sortOf(out))
+		}
+	})
+	t.Run("valid string lower-cased", func(t *testing.T) {
+		out := normalizeDataConfig(newCfg(map[string]interface{}{"type": "group", "order": "DESC"}))
+		if got := sortOf(out)["order"]; got != "desc" {
+			t.Fatalf("order=%v, want desc", got)
+		}
+	})
+	t.Run("illegal number not coerced", func(t *testing.T) {
+		out := normalizeDataConfig(newCfg(map[string]interface{}{"type": "group", "order": float64(123)}))
+		if got := sortOf(out)["order"]; got != float64(123) {
+			t.Fatalf("order=%v (type %T), want untouched 123", got, got)
+		}
+	})
+	t.Run("illegal nil not coerced", func(t *testing.T) {
+		out := normalizeDataConfig(newCfg(map[string]interface{}{"type": "view", "order": nil}))
+		got, has := sortOf(out)["order"]
+		if !has || got != nil {
+			t.Fatalf("order=%v has=%v, want present nil (untouched)", got, has)
+		}
+	})
+}
+
+// ── Text Block Tests ────────────────────────────────────────────────
+
+// TestBaseDashboardBlockExecuteCreate_TextType tests creating text blocks with markdown content.
+func TestBaseDashboardBlockExecuteCreate_TextType(t *testing.T) {
+	t.Run("valid text block", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		reg.Register(&httpmock.Stub{
+			Method: "POST",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks",
+			Body: map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"block_id": "blk_text",
+					"name":     "说明文字",
+					"type":     "text",
+					"data_config": map[string]interface{}{
+						"text": "# 标题\n**加粗**",
+					},
+				},
+			},
+		})
+		args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_001",
+			"--name", "说明文字", "--type", "text",
+			"--data-config", `{"text":"# 标题\n**加粗**"}`,
+		}
+		if err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout); err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		got := stdout.String()
+		if !strings.Contains(got, `"blk_text"`) || !strings.Contains(got, `"created": true`) {
+			t.Fatalf("stdout=%s", got)
+		}
+	})
+
+	t.Run("text block missing text field", func(t *testing.T) {
+		factory, stdout, _ := newExecuteFactory(t)
+		args := []string{"+dashboard-block-create", "--base-token", "app_x", "--dashboard-id", "dsh_001",
+			"--name", "Bad", "--type", "text",
+			"--data-config", `{}`,
+		}
+		err := runShortcut(t, BaseDashboardBlockCreate, args, factory, stdout)
+		if err == nil {
+			t.Fatalf("expected validation error for missing text field")
+		}
+		if got := err.Error(); !strings.Contains(got, "text") || !strings.Contains(got, "data_config 校验失败") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestBaseDashboardBlockExecuteUpdate_TextType tests updating text block content and name.
+func TestBaseDashboardBlockExecuteUpdate_TextType(t *testing.T) {
+	t.Run("update text content", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		reg.Register(&httpmock.Stub{
+			Method: "PATCH",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_text",
+			Body: map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"block_id": "blk_text",
+					"name":     "更新后的标题",
+					"type":     "text",
+					"data_config": map[string]interface{}{
+						"text": "# 新内容",
+					},
+				},
+			},
+		})
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_text",
+			"--name", "更新后的标题",
+			"--data-config", `{"text":"# 新内容"}`,
+		}
+		if err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout); err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		got := stdout.String()
+		if !strings.Contains(got, `"updated": true`) || !strings.Contains(got, "新内容") {
+			t.Fatalf("stdout=%s", got)
+		}
+	})
+
+	t.Run("update without type skips strict validation", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		// update 不传 type，不做强类型校验，直接透传给后端
+		reg.Register(&httpmock.Stub{
+			Method: "PATCH",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/blocks/blk_text",
+			Body: map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"block_id": "blk_text",
+					"type":     "text",
+				},
+			},
+		})
+		args := []string{"+dashboard-block-update", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--block-id", "blk_text",
+			"--data-config", `{"content":"xxx"}`,
+		}
+		// 不传 type，本地不做强校验，让后端处理
+		err := runShortcut(t, BaseDashboardBlockUpdate, args, factory, stdout)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := stdout.String(); !strings.Contains(got, `"updated": true`) {
+			t.Fatalf("stdout=%s", got)
+		}
+	})
+}
+
+// ── Dashboard Arrange ────────────────────────────────────────────────
+
+// TestBaseDashboardExecuteArrange tests the +dashboard-arrange command for auto-arranging dashboard blocks.
+func TestBaseDashboardExecuteArrange(t *testing.T) {
+	t.Run("arrange dashboard blocks", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		reg.Register(&httpmock.Stub{
+			Method: "POST",
+			URL:    "/open-apis/base/v3/bases/app_x/dashboards/dsh_001/arrange",
+			Body: map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"dashboard_id": "dsh_001",
+					"name":         "测试仪表盘",
+					"blocks": []interface{}{
+						map[string]interface{}{
+							"block_id":   "cht_xxx",
+							"block_name": "组件1",
+							"block_type": "column",
+							"layout": map[string]interface{}{
+								"x": 0, "y": 0, "w": 500, "h": 400,
+							},
+						},
+					},
+				},
+			},
+		})
+		args := []string{"+dashboard-arrange", "--base-token", "app_x", "--dashboard-id", "dsh_001"}
+		if err := runShortcut(t, BaseDashboardArrange, args, factory, stdout); err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		got := stdout.String()
+		if !strings.Contains(got, `"arranged": true`) || !strings.Contains(got, `"dashboard_id"`) {
+			t.Fatalf("stdout=%s", got)
+		}
+	})
+
+	t.Run("arrange with user-id-type", func(t *testing.T) {
+		factory, stdout, reg := newExecuteFactory(t)
+		reg.Register(&httpmock.Stub{
+			Method: "POST",
+			URL:    "user_id_type=union_id",
+			Body: map[string]interface{}{
+				"code": 0,
+				"data": map[string]interface{}{
+					"dashboard_id": "dsh_001",
+					"blocks":       []interface{}{},
+				},
+			},
+		})
+		args := []string{"+dashboard-arrange", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--user-id-type", "union_id"}
+		if err := runShortcut(t, BaseDashboardArrange, args, factory, stdout); err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if got := stdout.String(); !strings.Contains(got, `"arranged": true`) || !strings.Contains(got, `"dashboard_id"`) {
+			t.Fatalf("stdout=%s", got)
+		}
+	})
+}
+
+// TestBaseDashboardDryRun_Arrange tests the +dashboard-arrange --dry-run flag includes empty body.
+func TestBaseDashboardDryRun_Arrange(t *testing.T) {
+	factory, stdout, _ := newExecuteFactory(t)
+	args := []string{"+dashboard-arrange", "--base-token", "app_x", "--dashboard-id", "dsh_001", "--user-id-type", "union_id", "--dry-run", "--format", "pretty"}
+	if err := runShortcut(t, BaseDashboardArrange, args, factory, stdout); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "POST /open-apis/base/v3/bases/app_x/dashboards/dsh_001/arrange") || !strings.Contains(got, "union_id") || !strings.Contains(got, "{}") {
+		t.Fatalf("stdout=%s", got)
 	}
 }

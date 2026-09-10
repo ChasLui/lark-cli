@@ -4,28 +4,67 @@
 package doc
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
-	"os"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"path/filepath"
 
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 
-	"github.com/larksuite/cli/internal/output"
-	"github.com/larksuite/cli/internal/util"
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/extension/fileio"
 	"github.com/larksuite/cli/internal/validate"
 	"github.com/larksuite/cli/shortcuts/common"
 )
-
-const maxFileSize = 20 * 1024 * 1024 // 20MB
 
 var alignMap = map[string]int{
 	"left":   1,
 	"center": 2,
 	"right":  3,
+}
+
+const docWikiNodeByTokenPath = "/open-apis/wiki/v2/spaces/node_by_token"
+
+type docWikiNode struct {
+	ObjToken string
+	ObjType  string
+}
+
+func docWikiNodeLookupProblem(err error) error {
+	if problem, ok := errs.ProblemOf(err); ok {
+		switch problem.Code {
+		case 131012:
+			problem.Subtype, problem.Retryable = errs.SubtypeNotFound, false
+		case 131013, 131016:
+			problem.Subtype, problem.Retryable = errs.SubtypeInvalidParameters, false
+		case 131014:
+			problem.Subtype, problem.Retryable = errs.SubtypeFailedPrecondition, false
+		}
+	}
+	return err
+}
+
+// readClipboardImage is the clipboard read function, swappable in tests to
+// inject synthetic image bytes without depending on the host pasteboard.
+var readClipboardImage = readClipboardImageBytes
+
+// fileViewMap maps the user-facing --file-view value to the docx File block
+// `view_type` enum. The underlying values come from the open platform spec:
+//
+//	1 = card view (default)
+//	2 = preview view (renders audio/video files as an inline player)
+//	3 = inline view
+var fileViewMap = map[string]int{
+	"card":    1,
+	"preview": 2,
+	"inline":  3,
 }
 
 var DocMediaInsert = common.Shortcut{
@@ -36,19 +75,71 @@ var DocMediaInsert = common.Shortcut{
 	Scopes:      []string{"docs:document.media:upload", "docx:document:write_only", "docx:document:readonly"},
 	AuthTypes:   []string{"user", "bot"},
 	Flags: []common.Flag{
-		{Name: "file", Desc: "local file path (max 20MB)", Required: true},
+		{Name: "file", Desc: "local file path (files > 20MB use multipart upload automatically)"},
+		{Name: "from-clipboard", Type: "bool", Desc: "read image from system clipboard instead of a local file (macOS/Windows built-in; Linux requires xclip, xsel or wl-paste)"},
 		{Name: "doc", Desc: "document URL or document_id", Required: true},
 		{Name: "type", Default: "image", Desc: "type: image | file"},
 		{Name: "align", Desc: "alignment: left | center | right"},
 		{Name: "caption", Desc: "image caption text"},
+		{Name: "file-view", Desc: "file block rendering: card (default) | preview | inline; only applies when --type=file. preview renders audio/video as an inline player"},
+		{Name: "width", Type: "int", Desc: "image display width in pixels (only for --type=image); if --height is omitted it is auto-computed from the source image aspect ratio"},
+		{Name: "height", Type: "int", Desc: "image display height in pixels (only for --type=image); if --width is omitted it is auto-computed from the source image aspect ratio"},
 	},
 	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		filePath := runtime.Str("file")
+		fromClipboard := runtime.Bool("from-clipboard")
+		if filePath == "" && !fromClipboard {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "one of --file or --from-clipboard is required").WithParams(
+				errs.InvalidParam{Name: "--file", Reason: "provide either --file or --from-clipboard"},
+				errs.InvalidParam{Name: "--from-clipboard", Reason: "provide either --file or --from-clipboard"},
+			)
+		}
+		if filePath != "" && fromClipboard {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--file and --from-clipboard are mutually exclusive").WithParams(
+				errs.InvalidParam{Name: "--file", Reason: "mutually exclusive with --from-clipboard"},
+				errs.InvalidParam{Name: "--from-clipboard", Reason: "mutually exclusive with --file"},
+			)
+		}
+
 		docRef, err := parseDocumentRef(runtime.Str("doc"))
 		if err != nil {
 			return err
 		}
 		if docRef.Kind == "doc" {
-			return output.ErrValidation("docs +media-insert only supports docx documents; use a docx token/URL or a wiki URL that resolves to docx")
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "docs +media-insert only supports docx documents; use a docx token/URL or a wiki URL that resolves to docx").WithParam("--doc")
+		}
+		if view := runtime.Str("file-view"); view != "" {
+			if _, ok := fileViewMap[view]; !ok {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "invalid --file-view value %q, expected one of: card | preview | inline", view).WithParam("--file-view")
+			}
+			if runtime.Str("type") != "file" {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "--file-view only applies when --type=file").WithParam("--file-view")
+			}
+		}
+		widthChanged := runtime.Changed("width")
+		heightChanged := runtime.Changed("height")
+		if (widthChanged || heightChanged) && runtime.Str("type") != "image" {
+			var params []errs.InvalidParam
+			if widthChanged {
+				params = append(params, errs.InvalidParam{Name: "--width", Reason: "only applies when --type=image"})
+			}
+			if heightChanged {
+				params = append(params, errs.InvalidParam{Name: "--height", Reason: "only applies when --type=image"})
+			}
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--width/--height only apply when --type=image").WithParams(params...)
+		}
+		if widthChanged && runtime.Int("width") <= 0 {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--width must be a positive integer").WithParam("--width")
+		}
+		if heightChanged && runtime.Int("height") <= 0 {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--height must be a positive integer").WithParam("--height")
+		}
+		const maxDimension = 10000
+		if widthChanged && runtime.Int("width") > maxDimension {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--width must not exceed %d pixels", maxDimension).WithParam("--width")
+		}
+		if heightChanged && runtime.Int("height") > maxDimension {
+			return errs.NewValidationError(errs.SubtypeInvalidArgument, "--height must not exceed %d pixels", maxDimension).WithParam("--height")
 		}
 		return nil
 	},
@@ -61,45 +152,78 @@ var DocMediaInsert = common.Shortcut{
 		documentID := docRef.Token
 		stepBase := 1
 		filePath := runtime.Str("file")
+		if runtime.Bool("from-clipboard") {
+			filePath = "<clipboard image>"
+		}
 		mediaType := runtime.Str("type")
 		caption := runtime.Str("caption")
+		fileViewType := fileViewMap[runtime.Str("file-view")]
 
 		parentType := parentTypeForMediaType(mediaType)
-		createBlockData := buildCreateBlockData(mediaType, 0)
+		createBlockData := buildCreateBlockData(mediaType, 0, fileViewType)
 		createBlockData["index"] = "<children_len>"
-		batchUpdateData := buildBatchUpdateData("<new_block_id>", mediaType, "<file_token>", runtime.Str("align"), caption)
+		// Best-effort dimension computation for dry-run.
+		dryWidth := runtime.Int("width")
+		dryHeight := runtime.Int("height")
+		widthChanged := runtime.Changed("width")
+		heightChanged := runtime.Changed("height")
+
+		if (widthChanged || heightChanged) && !(widthChanged && heightChanged) {
+			if filePath == "<clipboard image>" {
+				fmt.Fprintf(runtime.IO().ErrOut, "Note: cannot detect clipboard image dimensions in dry-run; provide both --width and --height for accurate preview\n")
+			} else if nativeW, nativeH, err := detectImageDimensionsFromPath(runtime.FileIO(), filePath); err == nil {
+				dims := computeMissingDimension(dryWidth, dryHeight, nativeW, nativeH)
+				dryWidth = dims.width
+				dryHeight = dims.height
+			} else {
+				fmt.Fprintf(runtime.IO().ErrOut, "Note: unable to detect image dimensions from %s; provide both --width and --height to avoid failure at execution time\n", filePath)
+			}
+		}
+
+		batchUpdateData := buildBatchUpdateData("<new_block_id>", mediaType, "<file_token>", runtime.Str("align"), caption, dryWidth, dryHeight)
 
 		d := common.NewDryRunAPI()
+		totalSteps := 4
+		if docRef.Kind == "wiki" {
+			totalSteps++
+		}
+
 		if docRef.Kind == "wiki" {
 			documentID = "<resolved_docx_token>"
 			stepBase = 2
-			d.Desc("5-step orchestration: resolve wiki → query root → create block → upload file → bind to block (auto-rollback on failure)").
-				GET("/open-apis/wiki/v2/spaces/get_node").
+			d.Desc(fmt.Sprintf("%d-step orchestration: resolve wiki → query root → create block → upload file → bind to block (auto-rollback on failure)", totalSteps)).
+				GET(docWikiNodeByTokenPath).
 				Desc("[1] Resolve wiki node to docx document").
 				Params(map[string]interface{}{"token": docRef.Token})
 		} else {
-			d.Desc("4-step orchestration: query root → create block → upload file → bind to block (auto-rollback on failure)")
+			d.Desc(fmt.Sprintf("%d-step orchestration: query root → create block → upload file → bind to block (auto-rollback on failure)", totalSteps))
 		}
 
 		d.
 			GET("/open-apis/docx/v1/documents/:document_id/blocks/:document_id").
-			Desc(fmt.Sprintf("[%d] Get document root block", stepBase)).
+			Desc(fmt.Sprintf("[%d] Get document root block", stepBase))
+
+		d.
 			POST("/open-apis/docx/v1/documents/:document_id/blocks/:document_id/children").
-			Desc(fmt.Sprintf("[%d] Create empty block at document end", stepBase+1)).
-			Body(createBlockData).
-			POST("/open-apis/drive/v1/medias/upload_all").
-			Desc(fmt.Sprintf("[%d] Upload local file (multipart/form-data)", stepBase+2)).
-			Body(map[string]interface{}{
-				"file_name":   filepath.Base(filePath),
-				"parent_type": parentType,
-				"parent_node": "<new_block_id>",
-				"file":        "@" + filePath,
-			}).
-			PATCH("/open-apis/docx/v1/documents/:document_id/blocks/batch_update").
+			Desc(fmt.Sprintf("[%d] Create empty block at target position", stepBase+1)).
+			Body(createBlockData)
+		appendDocMediaInsertUploadDryRun(d, runtime.FileIO(), filePath, parentType, stepBase+2)
+		d.PATCH("/open-apis/docx/v1/documents/:document_id/blocks/batch_update").
 			Desc(fmt.Sprintf("[%d] Bind uploaded file token to the new block", stepBase+3)).
 			Body(batchUpdateData)
 
-		return d.Set("document_id", documentID)
+		d.Set("document_id", documentID)
+		// Annotate dry-run when reading from the clipboard: DryRun never touches
+		// the pasteboard, so it cannot tell in advance whether the payload is
+		// above or below the 20MB single-part threshold. Execute will make the
+		// real decision once it reads the bytes.
+		if runtime.Bool("from-clipboard") {
+			d.Set("upload_size_note", "clipboard size unknown; single-part vs multipart decision deferred to runtime")
+		}
+		if runtime.Bool("from-clipboard") && (widthChanged || heightChanged) && !(widthChanged && heightChanged) {
+			d.Set("dimension_note", "clipboard dimensions unknown; aspect-ratio calculation deferred to runtime")
+		}
+		return d
 	},
 	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
 		filePath := runtime.Str("file")
@@ -107,32 +231,43 @@ var DocMediaInsert = common.Shortcut{
 		mediaType := runtime.Str("type")
 		alignStr := runtime.Str("align")
 		caption := runtime.Str("caption")
+		fileViewType := fileViewMap[runtime.Str("file-view")]
 
-		safeFilePath, pathErr := validate.SafeInputPath(filePath)
-		if pathErr != nil {
-			return output.ErrValidation("unsafe file path: %s", pathErr)
+		// Clipboard path: read image bytes into memory, bypassing FileIO path validation.
+		var clipboardContent []byte
+		if runtime.Bool("from-clipboard") {
+			var err error
+			clipboardContent, err = readClipboardImage()
+			if err != nil {
+				return err
+			}
 		}
-		filePath = safeFilePath
 
 		documentID, err := resolveDocxDocumentID(runtime, docInput)
 		if err != nil {
 			return err
 		}
 
-		// Validate file
-		stat, err := os.Stat(filePath)
-		if err != nil {
-			return output.ErrValidation("file not found: %s", filePath)
+		// Determine file size and name.
+		var fileSize int64
+		var fileName string
+		if clipboardContent != nil {
+			fileSize = int64(len(clipboardContent))
+			fileName = "clipboard.png"
+		} else {
+			stat, err := runtime.FileIO().Stat(filePath)
+			if err != nil {
+				return wrapDocInputFileErr(err, "file not found")
+			}
+			if !stat.Mode().IsRegular() {
+				return errs.NewValidationError(errs.SubtypeInvalidArgument, "file must be a regular file: %s", filePath).WithParam("--file")
+			}
+			fileSize = stat.Size()
+			fileName = filepath.Base(filePath)
 		}
-		if stat.Size() > maxFileSize {
-			return output.ErrValidation("file %.1fMB exceeds 20MB limit", float64(stat.Size())/1024/1024)
-		}
-
-		fileName := filepath.Base(filePath)
-		fmt.Fprintf(runtime.IO().ErrOut, "Inserting: %s -> document %s\n", fileName, common.MaskToken(documentID))
 
 		// Step 1: Get document root block to find where to insert
-		rootData, err := runtime.CallAPI("GET",
+		rootData, err := runtime.CallAPITyped("GET",
 			fmt.Sprintf("/open-apis/docx/v1/documents/%s/blocks/%s", validate.EncodePathSegment(documentID), validate.EncodePathSegment(documentID)),
 			nil, nil)
 		if err != nil {
@@ -143,14 +278,10 @@ var DocMediaInsert = common.Shortcut{
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(runtime.IO().ErrOut, "Root block ready: %s (%d children)\n", parentBlockID, insertIndex)
-
-		// Step 2: Create an empty block at the end of the document
-		fmt.Fprintf(runtime.IO().ErrOut, "Creating block at index %d\n", insertIndex)
-
-		createData, err := runtime.CallAPI("POST",
+		// Step 2: Create an empty block at the target position
+		createData, err := runtime.CallAPITyped("POST",
 			fmt.Sprintf("/open-apis/docx/v1/documents/%s/blocks/%s/children", validate.EncodePathSegment(documentID), validate.EncodePathSegment(parentBlockID)),
-			nil, buildCreateBlockData(mediaType, insertIndex))
+			nil, buildCreateBlockData(mediaType, insertIndex, fileViewType))
 		if err != nil {
 			return err
 		}
@@ -158,18 +289,13 @@ var DocMediaInsert = common.Shortcut{
 		blockId, uploadParentNode, replaceBlockID := extractCreatedBlockTargets(createData, mediaType)
 
 		if blockId == "" {
-			return output.Errorf(output.ExitAPI, "api_error", "failed to create block: no block_id returned")
+			return errs.NewInternalError(errs.SubtypeInvalidResponse, "failed to create block: no block_id returned")
 		}
 
-		fmt.Fprintf(runtime.IO().ErrOut, "Block created: %s\n", blockId)
-		if uploadParentNode != blockId || replaceBlockID != blockId {
-			fmt.Fprintf(runtime.IO().ErrOut, "Resolved file block targets: upload=%s replace=%s\n", uploadParentNode, replaceBlockID)
-		}
-
-		// Rollback helper
+		// The placeholder block is created before any upload starts, so failures in
+		// later steps should try to remove it instead of leaving an empty artifact.
 		rollback := func() error {
-			fmt.Fprintf(runtime.IO().ErrOut, "Rolling back: deleting block %s\n", blockId)
-			_, err := runtime.CallAPI("DELETE",
+			_, err := runtime.CallAPITyped("DELETE",
 				fmt.Sprintf("/open-apis/docx/v1/documents/%s/blocks/%s/children/batch_delete", validate.EncodePathSegment(documentID), validate.EncodePathSegment(parentBlockID)),
 				nil, buildDeleteBlockData(insertIndex))
 			return err
@@ -183,30 +309,106 @@ var DocMediaInsert = common.Shortcut{
 			fmt.Fprintf(runtime.IO().ErrOut, "warning: %s\n", warning)
 			return opErr
 		}
+		withBindRollbackRecovery := func(opErr error, fileToken string) error {
+			rollbackErr := rollback()
+			rollbackStatus := "succeeded"
+			if rollbackErr != nil {
+				rollbackStatus = "failed"
+			}
+			hint := fmt.Sprintf(
+				"Document media upload succeeded but binding failed: phase=bind_media, document_id=%s, upload_succeeded=true, file_token=%s, block_id=%s, replace_block_id=%s, rollback=%s.",
+				documentID, fileToken, blockId, replaceBlockID, rollbackStatus,
+			)
+			if rollbackErr != nil {
+				hint += fmt.Sprintf(" rollback_error=%q. Do not blindly retry the upload; inspect or repair the existing block first.", rollbackErr.Error())
+			} else {
+				hint += " The placeholder block was removed; retry the original command if the operation is still needed."
+			}
+			return withDocRecoveryHint(opErr, hint)
+		}
 
-		// Step 3: Upload media file
-		fileToken, err := uploadMediaFile(ctx, runtime, filePath, fileName, mediaType, uploadParentNode, documentID)
+		// Step 3: Upload media file.
+		// Only materialize Content when clipboard bytes exist, so the `io.Reader`
+		// interface stays a true nil for the --file path. Passing a typed-nil
+		// *bytes.Reader here would make the downstream `if cfg.Content != nil`
+		// check incorrectly take the clipboard branch and crash on Read.
+		// Resolve display dimensions before upload to fail fast on unreadable images.
+		var finalWidth, finalHeight int
+		if mediaType == "image" {
+			userWidth := runtime.Int("width")
+			userHeight := runtime.Int("height")
+			widthChanged := runtime.Changed("width")
+			heightChanged := runtime.Changed("height")
+
+			if widthChanged && heightChanged {
+				finalWidth = userWidth
+				finalHeight = userHeight
+			} else if widthChanged || heightChanged {
+				var nativeW, nativeH int
+				var dimErr error
+				if clipboardContent != nil {
+					nativeW, nativeH, dimErr = detectImageDimensions(bytes.NewReader(clipboardContent))
+				} else {
+					f, openErr := runtime.FileIO().Open(filePath)
+					if openErr != nil {
+						return withRollbackWarning(errs.NewValidationError(errs.SubtypeInvalidArgument,
+							"unable to detect image dimensions from %s for aspect-ratio calculation; provide both --width and --height", fileName).WithCause(openErr).WithParams(
+							errs.InvalidParam{Name: "--width", Reason: "provide explicitly; source image dimensions could not be detected"},
+							errs.InvalidParam{Name: "--height", Reason: "provide explicitly; source image dimensions could not be detected"},
+						))
+					}
+					nativeW, nativeH, dimErr = detectImageDimensions(f)
+					f.Close()
+				}
+				if dimErr != nil {
+					return withRollbackWarning(errs.NewValidationError(errs.SubtypeInvalidArgument,
+						"unable to detect image dimensions from %s for aspect-ratio calculation; provide both --width and --height", fileName).WithCause(dimErr).WithParams(
+						errs.InvalidParam{Name: "--width", Reason: "provide explicitly; source image dimensions could not be detected"},
+						errs.InvalidParam{Name: "--height", Reason: "provide explicitly; source image dimensions could not be detected"},
+					))
+				}
+				dims := computeMissingDimension(userWidth, userHeight, nativeW, nativeH)
+				finalWidth = dims.width
+				finalHeight = dims.height
+			}
+		}
+
+		uploadCfg := UploadDocMediaFileConfig{
+			FilePath:   filePath,
+			FileName:   fileName,
+			FileSize:   fileSize,
+			ParentType: parentTypeForMediaType(mediaType),
+			ParentNode: uploadParentNode,
+			DocID:      documentID,
+		}
+		if clipboardContent != nil {
+			uploadCfg.Reader = bytes.NewReader(clipboardContent)
+		}
+		fileToken, err := uploadDocMediaFile(runtime, uploadCfg)
 		if err != nil {
 			return withRollbackWarning(err)
 		}
 
-		fmt.Fprintf(runtime.IO().ErrOut, "File uploaded: %s\n", fileToken)
-
 		// Step 4: Bind file token to block via batch_update
-		fmt.Fprintf(runtime.IO().ErrOut, "Binding uploaded media to block %s\n", replaceBlockID)
-
-		if _, err := runtime.CallAPI("PATCH",
+		if _, err := runtime.CallAPITyped("PATCH",
 			fmt.Sprintf("/open-apis/docx/v1/documents/%s/blocks/batch_update", validate.EncodePathSegment(documentID)),
-			nil, buildBatchUpdateData(replaceBlockID, mediaType, fileToken, alignStr, caption)); err != nil {
-			return withRollbackWarning(err)
+			nil, buildBatchUpdateData(replaceBlockID, mediaType, fileToken, alignStr, caption, finalWidth, finalHeight)); err != nil {
+			return withBindRollbackRecovery(err, fileToken)
 		}
 
-		runtime.Out(map[string]interface{}{
+		outData := map[string]interface{}{
 			"document_id": documentID,
 			"block_id":    blockId,
 			"file_token":  fileToken,
 			"type":        mediaType,
-		}, nil)
+		}
+		if finalWidth > 0 {
+			outData["width"] = finalWidth
+		}
+		if finalHeight > 0 {
+			outData["height"] = finalHeight
+		}
+		runtime.Out(outData, nil)
 		return nil
 	},
 }
@@ -225,12 +427,22 @@ func parentTypeForMediaType(mediaType string) string {
 	return "docx_image"
 }
 
-func buildCreateBlockData(mediaType string, index int) map[string]interface{} {
+func buildCreateBlockData(mediaType string, index int, fileViewType int) map[string]interface{} {
 	child := map[string]interface{}{
 		"block_type": blockTypeForMediaType(mediaType),
 	}
 	if mediaType == "file" {
-		child["file"] = map[string]interface{}{}
+		fileData := map[string]interface{}{}
+		// view_type can only be set at block creation time; the PATCH
+		// replace_file endpoint does not accept it, so if the caller wants
+		// preview/inline rendering we must wire it in here. Whitelist the
+		// concrete enum values so a stray positive int cannot produce a
+		// malformed payload if Validate is ever bypassed.
+		switch fileViewType {
+		case 1, 2, 3:
+			fileData["view_type"] = fileViewType
+		}
+		child["file"] = fileData
 	} else {
 		child["image"] = map[string]interface{}{}
 	}
@@ -259,37 +471,90 @@ func resolveDocxDocumentID(runtime *common.RuntimeContext, input string) (string
 	case "docx":
 		return docRef.Token, nil
 	case "doc":
-		return "", output.ErrValidation("docs +media-insert only supports docx documents; use a docx token/URL or a wiki URL that resolves to docx")
+		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "this document operation only supports docx documents; use a docx token/URL or a wiki URL that resolves to docx").WithParam("--doc")
 	case "wiki":
-		fmt.Fprintf(runtime.IO().ErrOut, "Resolving wiki node: %s\n", common.MaskToken(docRef.Token))
-		data, err := runtime.CallAPI(
+		data, err := runtime.CallAPITyped(
 			"GET",
-			"/open-apis/wiki/v2/spaces/get_node",
+			docWikiNodeByTokenPath,
 			map[string]interface{}{"token": docRef.Token},
 			nil,
 		)
 		if err != nil {
-			return "", err
+			return "", docWikiNodeLookupProblem(err)
 		}
 
-		node := common.GetMap(data, "node")
-		objType := common.GetString(node, "obj_type")
-		objToken := common.GetString(node, "obj_token")
-		if objType == "" || objToken == "" {
-			return "", output.Errorf(output.ExitAPI, "api_error", "wiki get_node returned incomplete node data")
+		nodeData := common.GetMap(data, "node")
+		node := docWikiNode{
+			ObjToken: common.GetString(nodeData, "obj_token"),
+			ObjType:  common.GetString(nodeData, "obj_type"),
 		}
-		if objType != "docx" {
-			return "", output.ErrValidation("wiki resolved to %q, but docs +media-insert only supports docx documents", objType)
+		if node.ObjType == "" || node.ObjToken == "" {
+			return "", errs.NewInternalError(errs.SubtypeInvalidResponse, "wiki node_by_token returned incomplete node data")
+		}
+		if node.ObjType != "docx" {
+			return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "wiki resolved to %q, but this document operation only supports docx documents", node.ObjType).WithParam("--doc")
 		}
 
-		fmt.Fprintf(runtime.IO().ErrOut, "Resolved wiki to docx: %s\n", common.MaskToken(objToken))
-		return objToken, nil
+		return node.ObjToken, nil
 	default:
-		return "", output.ErrValidation("docs +media-insert only supports docx documents")
+		return "", errs.NewValidationError(errs.SubtypeInvalidArgument, "this document operation only supports docx documents").WithParam("--doc")
 	}
 }
 
-func buildBatchUpdateData(blockID, mediaType, fileToken, alignStr, caption string) map[string]interface{} {
+type imageDimensions struct {
+	width  int
+	height int
+}
+
+func computeMissingDimension(userWidth, userHeight, nativeWidth, nativeHeight int) imageDimensions {
+	if nativeWidth <= 0 || nativeHeight <= 0 {
+		return imageDimensions{width: userWidth, height: userHeight}
+	}
+	if userWidth > 0 && userHeight == 0 {
+		return imageDimensions{
+			width:  userWidth,
+			height: (userWidth*nativeHeight + nativeWidth/2) / nativeWidth,
+		}
+	}
+	if userHeight > 0 && userWidth == 0 {
+		return imageDimensions{
+			width:  (userHeight*nativeWidth + nativeHeight/2) / nativeHeight,
+			height: userHeight,
+		}
+	}
+	return imageDimensions{width: userWidth, height: userHeight}
+}
+
+func detectImageDimensions(r io.Reader) (width, height int, err error) {
+	cfg, _, err := image.DecodeConfig(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	return cfg.Width, cfg.Height, nil
+}
+
+func detectImageDimensionsFromPath(fio fileio.FileIO, filePath string) (int, int, error) {
+	width, height, _, err := detectImageConfigFromPath(fio, filePath)
+	return width, height, err
+}
+
+func detectImageConfigFromPath(fio fileio.FileIO, filePath string) (int, int, string, error) {
+	if _, err := validate.SafeInputPath(filePath); err != nil {
+		return 0, 0, "", err
+	}
+	f, err := fio.Open(filePath)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	defer f.Close()
+	cfg, format, err := image.DecodeConfig(f)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	return cfg.Width, cfg.Height, format, nil
+}
+
+func buildBatchUpdateData(blockID, mediaType, fileToken, alignStr, caption string, width, height int) map[string]interface{} {
 	request := map[string]interface{}{
 		"block_id": blockID,
 	}
@@ -300,6 +565,12 @@ func buildBatchUpdateData(blockID, mediaType, fileToken, alignStr, caption strin
 	} else {
 		replaceImage := map[string]interface{}{
 			"token": fileToken,
+		}
+		if width > 0 {
+			replaceImage["width"] = width
+		}
+		if height > 0 {
+			replaceImage["height"] = height
 		}
 		if alignVal, ok := alignMap[alignStr]; ok {
 			replaceImage["align"] = alignVal
@@ -316,13 +587,13 @@ func buildBatchUpdateData(blockID, mediaType, fileToken, alignStr, caption strin
 	}
 }
 
-func extractAppendTarget(rootData map[string]interface{}, fallbackBlockID string) (string, int, error) {
+func extractAppendTarget(rootData map[string]interface{}, fallbackBlockID string) (parentBlockID string, insertIndex int, err error) {
 	block, _ := rootData["block"].(map[string]interface{})
 	if len(block) == 0 {
-		return "", 0, output.Errorf(output.ExitAPI, "api_error", "failed to query document root block")
+		return "", 0, errs.NewInternalError(errs.SubtypeInvalidResponse, "failed to query document root block")
 	}
 
-	parentBlockID := fallbackBlockID
+	parentBlockID = fallbackBlockID
 	if blockID, _ := block["block_id"].(string); blockID != "" {
 		parentBlockID = blockID
 	}
@@ -346,6 +617,8 @@ func extractCreatedBlockTargets(createData map[string]interface{}, mediaType str
 		return blockID, uploadParentNode, replaceBlockID
 	}
 
+	// File blocks are wrapped: the created top-level block owns a nested child
+	// that is both the upload target and the replace_file target.
 	nestedChildren, _ := child["children"].([]interface{})
 	if len(nestedChildren) == 0 {
 		return blockID, uploadParentNode, replaceBlockID
@@ -357,66 +630,44 @@ func extractCreatedBlockTargets(createData map[string]interface{}, mediaType str
 	return blockID, uploadParentNode, replaceBlockID
 }
 
-// uploadMediaFile uploads a file to Feishu drive as media.
-func uploadMediaFile(ctx context.Context, runtime *common.RuntimeContext, filePath, fileName, mediaType, parentNode, docId string) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return "", output.Errorf(output.ExitInternal, "internal_error", "failed to stat file: %v", err)
-	}
-	fileSize := stat.Size()
-
-	parentType := parentTypeForMediaType(mediaType)
-
-	// Build SDK Formdata
-	fd := larkcore.NewFormdata()
-	fd.AddField("file_name", fileName)
-	fd.AddField("parent_type", parentType)
-	fd.AddField("parent_node", parentNode)
-	fd.AddField("size", fmt.Sprintf("%d", fileSize))
-	if docId != "" {
-		extra, err := buildDriveRouteExtra(docId)
-		if err != nil {
-			return "", err
-		}
-		fd.AddField("extra", extra)
-	}
-	fd.AddFile("file", f)
-
-	apiResp, err := runtime.DoAPI(&larkcore.ApiReq{
-		HttpMethod: http.MethodPost,
-		ApiPath:    "/open-apis/drive/v1/medias/upload_all",
-		Body:       fd,
-	}, larkcore.WithFileUpload())
-	if err != nil {
-		var exitErr *output.ExitError
-		if errors.As(err, &exitErr) {
-			return "", err
-		}
-		return "", output.ErrNetwork("file upload failed: %v", err)
+func appendDocMediaInsertUploadDryRun(d *common.DryRunAPI, fio fileio.FileIO, filePath, parentType string, step int) {
+	// The upload step runs only after the empty placeholder block is created, so
+	// dry-run can refer to that future block ID only symbolically. For large
+	// files, keep multipart internals as substeps of the single user-facing
+	// "upload file" step.
+	if docMediaShouldUseMultipart(fio, filePath) {
+		d.POST("/open-apis/drive/v1/medias/upload_prepare").
+			Desc(fmt.Sprintf("[%da] Initialize multipart upload", step)).
+			Body(map[string]interface{}{
+				"file_name":   filepath.Base(filePath),
+				"parent_type": parentType,
+				"parent_node": "<new_block_id>",
+				"size":        "<file_size>",
+			}).
+			POST("/open-apis/drive/v1/medias/upload_part").
+			Desc(fmt.Sprintf("[%db] Upload file parts (repeated)", step)).
+			Body(map[string]interface{}{
+				"upload_id": "<upload_id>",
+				"seq":       "<chunk_index>",
+				"size":      "<chunk_size>",
+				"file":      "<chunk_binary>",
+			}).
+			POST("/open-apis/drive/v1/medias/upload_finish").
+			Desc(fmt.Sprintf("[%dc] Finalize multipart upload and get file_token", step)).
+			Body(map[string]interface{}{
+				"upload_id": "<upload_id>",
+				"block_num": "<block_num>",
+			})
+		return
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(apiResp.RawBody, &result); err != nil {
-		return "", output.Errorf(output.ExitAPI, "api_error", "file upload failed: invalid response JSON: %v", err)
-	}
-
-	code, _ := util.ToFloat64(result["code"])
-	if code != 0 {
-		msg, _ := result["msg"].(string)
-		return "", output.ErrAPI(int(code), fmt.Sprintf("file upload failed: [%d] %s", int(code), msg), result["error"])
-	}
-
-	data, _ := result["data"].(map[string]interface{})
-	fileToken, _ := data["file_token"].(string)
-	if fileToken == "" {
-		return "", output.Errorf(output.ExitAPI, "api_error", "file upload failed: no file_token returned")
-	}
-
-	return fileToken, nil
+	d.POST("/open-apis/drive/v1/medias/upload_all").
+		Desc(fmt.Sprintf("[%d] Upload local file (multipart/form-data)", step)).
+		Body(map[string]interface{}{
+			"file_name":   filepath.Base(filePath),
+			"parent_type": parentType,
+			"parent_node": "<new_block_id>",
+			"size":        "<file_size>",
+			"file":        "@" + filePath,
+		})
 }

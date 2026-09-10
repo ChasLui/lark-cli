@@ -5,36 +5,63 @@ package cmdutil
 
 import (
 	"encoding/json"
+	"io"
 
-	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/errs"
+	"github.com/larksuite/cli/extension/fileio"
 )
 
 // ParseOptionalBody parses --data JSON for methods that accept a request body.
+// Supports stdin (-), @file, @@-escape, and single-quote stripping via ResolveInput.
 // Returns (nil, nil) if the method has no body or data is empty.
-func ParseOptionalBody(httpMethod, data string) (interface{}, error) {
+func ParseOptionalBody(httpMethod, data string, stdin io.Reader, fileIO fileio.FileIO) (interface{}, error) {
 	switch httpMethod {
 	case "POST", "PUT", "PATCH", "DELETE":
 	default:
 		return nil, nil
 	}
-	if data == "" {
+	resolved, err := ResolveInput(data, stdin, fileIO)
+	if err != nil {
+		return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "--data: %s", err).
+			WithParam("--data").
+			WithCause(err)
+	}
+	if resolved == "" {
 		return nil, nil
 	}
 	var body interface{}
-	if err := json.Unmarshal([]byte(data), &body); err != nil {
-		return nil, output.ErrValidation("--data invalid JSON format")
+	if err := json.Unmarshal([]byte(resolved), &body); err != nil {
+		return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "--data invalid JSON format").
+			WithParam("--data").
+			WithCause(err)
 	}
 	return body, nil
 }
 
-// ParseJSONMap parses a JSON string into a map. Returns an empty map if input is empty.
-func ParseJSONMap(input, label string) (map[string]any, error) {
-	if input == "" {
+// ParseJSONMap parses a JSON string into a map. Returns an empty (never nil) map
+// for empty input or the JSON literal null, so callers can always overlay onto
+// the result without a nil-map panic.
+// Supports stdin (-), @file, @@-escape, and single-quote stripping via ResolveInput.
+func ParseJSONMap(input, label string, stdin io.Reader, fileIO fileio.FileIO) (map[string]any, error) {
+	resolved, err := ResolveInput(input, stdin, fileIO)
+	if err != nil {
+		return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "%s: %s", label, err).
+			WithParam(label).
+			WithCause(err)
+	}
+	if resolved == "" {
 		return map[string]any{}, nil
 	}
 	var result map[string]any
-	if err := json.Unmarshal([]byte(input), &result); err != nil {
-		return nil, output.ErrValidation("%s invalid format, expected JSON object", label)
+	if err := json.Unmarshal([]byte(resolved), &result); err != nil {
+		return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "%s invalid format, expected JSON object", label).
+			WithParam(label).
+			WithCause(err)
+	}
+	if result == nil {
+		// `null` unmarshals into a nil map without error; normalize it so the
+		// returned map is always writable, matching the empty-input case.
+		return map[string]any{}, nil
 	}
 	return result, nil
 }

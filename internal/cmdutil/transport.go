@@ -6,6 +6,15 @@ package cmdutil
 import (
 	"net/http"
 	"time"
+
+	"github.com/larksuite/cli/internal/transport"
+)
+
+var (
+	_ transport.RoundTripperDecorator = (*RetryTransport)(nil)
+	_ transport.RoundTripperDecorator = (*UserAgentTransport)(nil)
+	_ transport.RoundTripperDecorator = (*BuildHeaderTransport)(nil)
+	_ transport.RoundTripperDecorator = (*SecurityHeaderTransport)(nil)
 )
 
 // RetryTransport is an http.RoundTripper that retries on 5xx responses
@@ -20,7 +29,17 @@ func (t *RetryTransport) base() http.RoundTripper {
 	if t.Base != nil {
 		return t.Base
 	}
-	return http.DefaultTransport
+	return transport.Fallback()
+}
+
+func (t *RetryTransport) BaseRoundTripper() http.RoundTripper {
+	return t.base()
+}
+
+func (t *RetryTransport) WithBaseRoundTripper(base http.RoundTripper) http.RoundTripper {
+	cloned := *t
+	cloned.Base = base
+	return &cloned
 }
 
 func (t *RetryTransport) delay() time.Duration {
@@ -59,13 +78,55 @@ type UserAgentTransport struct {
 	Base http.RoundTripper
 }
 
+func (t *UserAgentTransport) BaseRoundTripper() http.RoundTripper {
+	if t.Base != nil {
+		return t.Base
+	}
+	return transport.Fallback()
+}
+
+func (t *UserAgentTransport) WithBaseRoundTripper(base http.RoundTripper) http.RoundTripper {
+	cloned := *t
+	cloned.Base = base
+	return &cloned
+}
+
 func (t *UserAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set(HeaderUserAgent, UserAgentValue())
 	if t.Base != nil {
 		return t.Base.RoundTrip(req)
 	}
-	return http.DefaultTransport.RoundTrip(req)
+	return transport.Fallback().RoundTrip(req)
+}
+
+// BuildHeaderTransport is an http.RoundTripper that force-writes the
+// X-Cli-Build header before every request. It remains in the SDK transport
+// chain as a narrow defense-in-depth layer alongside SecurityHeaderTransport.
+type BuildHeaderTransport struct {
+	Base http.RoundTripper
+}
+
+func (t *BuildHeaderTransport) BaseRoundTripper() http.RoundTripper {
+	if t.Base != nil {
+		return t.Base
+	}
+	return transport.Fallback()
+}
+
+func (t *BuildHeaderTransport) WithBaseRoundTripper(base http.RoundTripper) http.RoundTripper {
+	cloned := *t
+	cloned.Base = base
+	return &cloned
+}
+
+func (t *BuildHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set(HeaderBuild, DetectBuildKind())
+	if t.Base != nil {
+		return t.Base.RoundTrip(req)
+	}
+	return transport.Fallback().RoundTrip(req)
 }
 
 // SecurityHeaderTransport is an http.RoundTripper that injects CLI security
@@ -78,7 +139,17 @@ func (t *SecurityHeaderTransport) base() http.RoundTripper {
 	if t.Base != nil {
 		return t.Base
 	}
-	return http.DefaultTransport
+	return transport.Fallback()
+}
+
+func (t *SecurityHeaderTransport) BaseRoundTripper() http.RoundTripper {
+	return t.base()
+}
+
+func (t *SecurityHeaderTransport) WithBaseRoundTripper(base http.RoundTripper) http.RoundTripper {
+	cloned := *t
+	cloned.Base = base
+	return &cloned
 }
 
 // RoundTrip implements http.RoundTripper.

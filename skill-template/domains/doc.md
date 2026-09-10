@@ -21,15 +21,15 @@
 
 #### 处理流程
 
-1. **使用 `wiki.spaces.get_node` 查询节点信息**
+1. **使用 `wiki +node-get` 查询节点信息**
    ```bash
-   lark-cli wiki spaces get_node --params '{"token":"wiki_token"}'
+   lark-cli wiki +node-get --node-token 'https://xxx.feishu.cn/wiki/<wiki_token>' --format json
    ```
 
 2. **从返回结果中提取关键信息**
-   - `node.obj_type`：文档类型（docx/doc/sheet/bitable/slides/file/mindnote）
-   - `node.obj_token`：**真实的文档 token**（用于后续操作）
-   - `node.title`：文档标题
+   - `data.obj_type`：文档类型（docx/doc/sheet/bitable/slides/file/mindnote）
+   - `data.obj_token`：**真实的文档 token**（用于后续操作）
+   - `data.title`：文档标题
 
 3. **根据 `obj_type` 使用对应的 API**
 
@@ -47,13 +47,15 @@
 
 ```bash
 # 查询 wiki 节点
-lark-cli wiki spaces get_node --params '{"token":"wiki_token"}'
+lark-cli wiki +node-get --node-token 'https://xxx.feishu.cn/wiki/<wiki_token>' --format json
 ```
 
-返回结果示例：
+返回结果中的路由关键字段示例（`data` 中的其他节点字段省略）：
 ```json
 {
-   "node": {
+   "ok": true,
+   "identity": "user",
+   "data": {
       "obj_type": "docx",
       "obj_token": "xxxx",
       "title": "标题",
@@ -106,9 +108,8 @@ Drive Folder (云空间文件夹)
 - 编辑画板需要使用专门的 [`../lark-whiteboard/SKILL.md`](../lark-whiteboard/SKILL.md)
 
 ## 快速决策
-- 用户说“找一个表格”“按名称搜电子表格”“找报表”“最近打开的表格”，先用 `lark-cli docs +search` 做资源发现。
-- `docs +search` 不是只搜文档 / Wiki；结果里会直接返回 `SHEET` 等云空间对象。
+- 用户说“看一下文档里的图片/附件/素材”“预览素材”，优先用 `lark-cli docs +media-preview`。
+- 用户明确说“下载素材”，再用 `lark-cli docs +media-download`。
+- 如果目标明确是画板 / whiteboard / 画板缩略图，只能用 `lark-cli docs +media-download --type whiteboard`，不要用 `+media-preview`。
 - 拿到 spreadsheet URL / token 后，再切到 `lark-sheets` 做对象内部读取、筛选、写入等操作。
-
-## 补充说明 
-`docs +search` 除了搜索文档 / Wiki，也承担“先定位云空间对象，再切回对应业务 skill 操作”的资源发现入口角色；当用户口头说“表格 / 报表”时，也优先从这里开始。
+- 用户说“给文档加评论”“查看评论”“回复评论”“给评论加表情 / reaction”“删除评论表情 / reaction”，**不要留在 `lark-doc`**，直接切到 `lark-drive` 处理。

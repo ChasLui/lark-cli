@@ -5,24 +5,32 @@ package auth
 
 import (
 	"context"
-	"time"
 
 	"github.com/spf13/cobra"
 
-	larkauth "github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/cmdutil"
-	"github.com/larksuite/cli/internal/core"
+	"github.com/larksuite/cli/internal/identitydiag"
 	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/recovery"
 )
 
 // StatusOptions holds all inputs for auth status.
 type StatusOptions struct {
 	Factory *cmdutil.Factory
 	Verify  bool
+	JSON    bool
 }
 
 // NewCmdAuthStatus creates the auth status subcommand.
 func NewCmdAuthStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Command {
+	return newCmdAuthStatus(f, runF, nil)
+}
+
+func newCmdAuthStatus(
+	f *cmdutil.Factory,
+	runF func(*StatusOptions) error,
+	projector *recovery.Projector,
+) *cobra.Command {
 	opts := &StatusOptions{Factory: f}
 
 	cmd := &cobra.Command{
@@ -32,16 +40,18 @@ func NewCmdAuthStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobr
 			if runF != nil {
 				return runF(opts)
 			}
-			return authStatusRun(opts)
+			return authStatusRun(opts, projector)
 		},
 	}
 
 	cmd.Flags().BoolVar(&opts.Verify, "verify", false, "verify token against server (requires network)")
+	cmd.Flags().BoolVar(&opts.JSON, "json", false, "structured JSON output")
+	cmdutil.SetRisk(cmd, "read")
 
 	return cmd
 }
 
-func authStatusRun(opts *StatusOptions) error {
+func authStatusRun(opts *StatusOptions, projector *recovery.Projector) error {
 	f := opts.Factory
 
 	config, err := f.Config()
@@ -59,73 +69,76 @@ func authStatusRun(opts *StatusOptions) error {
 		"defaultAs": defaultAs,
 	}
 
-	if config.UserOpenId == "" {
-		result["identity"] = "bot"
-		result["note"] = "No user logged in. Only bot (tenant) identity is available for API calls. Run `lark-cli auth login` to log in."
-		output.PrintJson(f.IOStreams.Out, result)
-		return nil
-	}
-
-	stored := larkauth.GetStoredToken(config.AppID, config.UserOpenId)
-	if stored == nil {
-		result["identity"] = "bot"
-		result["userName"] = config.UserName
-		result["userOpenId"] = config.UserOpenId
-		result["note"] = "Token does not exist or has been cleared. Only bot (tenant) identity is available. Re-login: lark-cli auth login"
-		output.PrintJson(f.IOStreams.Out, result)
-		return nil
-	}
-
-	status := larkauth.TokenStatus(stored)
-	if status == "expired" {
-		result["identity"] = "bot"
-		result["note"] = "User token has expired. Only bot (tenant) identity is available. Re-login: lark-cli auth login"
-	} else {
-		result["identity"] = "user"
-	}
-	result["userName"] = config.UserName
-	result["userOpenId"] = config.UserOpenId
-	result["tokenStatus"] = status
-	result["scope"] = stored.Scope
-	result["expiresAt"] = time.UnixMilli(stored.ExpiresAt).Format(time.RFC3339)
-	result["refreshExpiresAt"] = time.UnixMilli(stored.RefreshExpiresAt).Format(time.RFC3339)
-	result["grantedAt"] = time.UnixMilli(stored.GrantedAt).Format(time.RFC3339)
-
-	// --verify: call the server to confirm token is actually usable.
-	if opts.Verify && status != "expired" {
-		verified, verifyErr := verifyTokenOnServer(f, config)
-		result["verified"] = verified
-		if verifyErr != "" {
-			result["verifyError"] = verifyErr
-		}
-	}
+	diagnostics := identitydiag.FilterRecovery(
+		identitydiag.Diagnose(context.Background(), f, config, opts.Verify),
+		projector,
+	)
+	result["identities"] = diagnostics
+	result["identity"] = effectiveIdentity(diagnostics)
+	addEffectiveVerification(result, diagnostics)
+	addStatusNote(result, diagnostics, projector.CanReference(recovery.TargetAuthLogin))
 
 	output.PrintJson(f.IOStreams.Out, result)
 	return nil
 }
 
-// verifyTokenOnServer obtains a valid access token (refreshing if needed)
-// and calls /authen/v1/user_info to confirm the server accepts it.
-// Returns (true, "") on success or (false, reason) on failure.
-func verifyTokenOnServer(f *cmdutil.Factory, config *core.CliConfig) (bool, string) {
-	httpClient, err := f.HttpClient()
-	if err != nil {
-		return false, "failed to create HTTP client: " + err.Error()
-	}
+const (
+	identityUser = "user"
+	identityBot  = "bot"
+	identityNone = "none"
+)
 
-	token, err := larkauth.GetValidAccessToken(httpClient, larkauth.NewUATCallOptions(config, f.IOStreams.ErrOut))
-	if err != nil {
-		return false, "token unusable: " + err.Error()
+func effectiveIdentity(d identitydiag.Result) string {
+	switch {
+	case d.User.Available:
+		return identityUser
+	case d.Bot.Available:
+		return identityBot
+	default:
+		return identityNone
 	}
+}
 
-	sdk, err := f.LarkClient()
-	if err != nil {
-		return false, "failed to create SDK client: " + err.Error()
+func addEffectiveVerification(result map[string]interface{}, d identitydiag.Result) {
+	switch result["identity"] {
+	case identityUser:
+		if d.User.Verified != nil {
+			result["verified"] = *d.User.Verified
+			if !*d.User.Verified {
+				result["verifyError"] = d.User.Message
+			}
+		}
+	case identityBot:
+		if d.Bot.Verified != nil {
+			result["verified"] = *d.Bot.Verified
+			if !*d.Bot.Verified {
+				result["verifyError"] = d.Bot.Message
+			}
+		}
 	}
+}
 
-	if err := larkauth.VerifyUserToken(context.Background(), sdk, token); err != nil {
-		return false, "server rejected token: " + err.Error()
+func addStatusNote(result map[string]interface{}, d identitydiag.Result, canAuthLogin bool) {
+	switch {
+	case d.User.Status == identitydiag.StatusError:
+		note := d.User.Message
+		if d.User.Hint != "" {
+			note += " " + d.User.Hint
+		}
+		result["note"] = note
+	case !d.User.Available && d.Bot.Available:
+		note := "User identity is " + identitydiag.StatusMessage(d.User.Status) + "; bot identity is ready for bot/tenant API calls."
+		if canAuthLogin {
+			note += " Run `lark-cli auth login` to enable user identity."
+		}
+		result["note"] = note
+	case d.User.Status == identitydiag.StatusNeedsRefresh:
+		result["note"] = "User identity needs refresh and will be refreshed automatically on the next user API call."
+	case !d.User.Available && !d.Bot.Available:
+		note := "No usable identity is available. Configure bot credentials"
+		if canAuthLogin {
+			note += " or run `lark-cli auth login`"
+		}
+		result["note"] = note + "."
 	}
-
-	return true, ""
 }
